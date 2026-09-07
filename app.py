@@ -1,4 +1,3 @@
-Building difficulty profiler V1
 
 import streamlit as st
 import sqlite3
