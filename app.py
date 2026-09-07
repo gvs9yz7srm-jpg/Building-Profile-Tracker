@@ -1,16 +1,30 @@
 import streamlit as st
 import sqlite3
 import re
-import html
+from io import BytesIO
 from datetime import datetime, date, time, timedelta
 from statistics import median
+
 from PIL import Image, ImageEnhance
 import pytesseract
 
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+from reportlab.lib import colors
+
 
 # ============================================================
-# BUILDING DIFFICULTY INTELLIGENCE — V3.2
-# Proof-of-concept
+# BUILDING DIFFICULTY INTELLIGENCE — V3.3
 # ============================================================
 
 st.set_page_config(
@@ -122,8 +136,7 @@ CREATE TABLE IF NOT EXISTS prediction_reports (
     total_stops INTEGER DEFAULT 0,
     total_jobs INTEGER DEFAULT 0,
     flagged_stops INTEGER DEFAULT 0,
-    predicted_delay INTEGER DEFAULT 0,
-    report_html TEXT
+    predicted_delay INTEGER DEFAULT 0
 )
 """)
 
@@ -144,6 +157,15 @@ CREATE TABLE IF NOT EXISTS prediction_jobs (
     predicted_delay INTEGER DEFAULT 0,
     reasons TEXT,
     FOREIGN KEY (report_id) REFERENCES prediction_reports(id)
+)
+""")
+
+
+# New V3.3 settings table
+execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT
 )
 """)
 
@@ -223,33 +245,66 @@ DAYS = [
 ]
 
 
+STREET_TYPES = (
+    r"Street|St|Road|Rd|Avenue|Ave|Parade|Pde|"
+    r"Drive|Dr|Lane|Ln|Way|Crescent|Cres|Circuit|"
+    r"Boulevard|Blvd|Place|Pl|Close|Court|Ct|"
+    r"Terrace|Tce|Highway|Hwy"
+)
+
+
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-if "conditions" not in st.session_state:
-    st.session_state.conditions = []
+defaults = {
+    "conditions": [],
+    "schedule_stage": "upload",
+    "extracted_jobs": [],
+    "analysed_jobs": [],
+    "analysis_summary": {},
+    "analysis_date": date.today(),
+    "generated_pdf": None,
+    "schedule_uploader_key": 0,
+}
 
-if "schedule_stage" not in st.session_state:
-    st.session_state.schedule_stage = "upload"
 
-if "extracted_jobs" not in st.session_state:
-    st.session_state.extracted_jobs = []
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-if "analysed_jobs" not in st.session_state:
-    st.session_state.analysed_jobs = []
 
-if "analysis_summary" not in st.session_state:
-    st.session_state.analysis_summary = {}
+# ============================================================
+# SETTINGS
+# ============================================================
 
-if "analysis_date" not in st.session_state:
-    st.session_state.analysis_date = date.today()
+def get_setting(key, default=""):
+    row = execute("""
+        SELECT setting_value
+        FROM settings
+        WHERE setting_key = ?
+    """, (key,)).fetchone()
 
-if "generated_report" not in st.session_state:
-    st.session_state.generated_report = ""
+    if row:
+        return row["setting_value"]
 
-if "schedule_uploader_key" not in st.session_state:
-    st.session_state.schedule_uploader_key = 0
+    return default
+
+
+def save_setting(key, value):
+    execute("""
+        INSERT INTO settings (
+            setting_key,
+            setting_value
+        )
+        VALUES (?, ?)
+        ON CONFLICT(setting_key)
+        DO UPDATE SET
+            setting_value = excluded.setting_value
+    """, (
+        key,
+        value.strip()
+    ))
 
 
 # ============================================================
@@ -298,13 +353,14 @@ def normalise_time(value):
         return ""
 
     value = value.strip().upper()
-
     value = value.replace(".", ":")
 
     formats = [
         "%H:%M",
+        "%H:%M:%S",
         "%I:%M %p",
-        "%I:%M%p"
+        "%I:%M:%S %p",
+        "%I:%M%p",
     ]
 
     for fmt in formats:
@@ -317,6 +373,14 @@ def normalise_time(value):
             pass
 
     return ""
+
+
+def week_start():
+    today = date.today()
+
+    return today - timedelta(
+        days=today.weekday()
+    )
 
 
 def pattern_status(count, confirmed):
@@ -342,14 +406,6 @@ def confidence(count):
     return "Low"
 
 
-def week_start():
-    today = date.today()
-
-    return today - timedelta(
-        days=today.weekday()
-    )
-
-
 def time_inside_window(planned, start, end):
     if not planned or not start or not end:
         return False
@@ -371,11 +427,7 @@ def time_inside_window(planned, start, end):
         ).time()
 
         if start_time <= end_time:
-            return (
-                start_time
-                <= planned_time
-                <= end_time
-            )
+            return start_time <= planned_time <= end_time
 
         return (
             planned_time >= start_time
@@ -387,6 +439,119 @@ def time_inside_window(planned, start, end):
 
 
 # ============================================================
+# V3.3 ADDRESS CLEANER
+# ============================================================
+
+def clean_address_line(line):
+    """
+    Important V3.3 change.
+
+    OCR sometimes reads:
+        44B Sydney Street eee peers
+        28/143-147 Parramatta Road eee arms
+
+    We deliberately stop the address at the recognised
+    street type.
+    """
+
+    if not line:
+        return ""
+
+    line = re.sub(
+        r"\s+",
+        " ",
+        line
+    ).strip()
+
+    pattern = (
+        rf"^(.+?\b(?:{STREET_TYPES})\b)"
+    )
+
+    match = re.search(
+        pattern,
+        line,
+        re.IGNORECASE
+    )
+
+    if match:
+        return match.group(1).strip()
+
+    return line
+
+
+def looks_like_address(line):
+    if not line:
+        return False
+
+    cleaned = clean_address_line(line)
+
+    return bool(
+        re.search(r"\d", cleaned)
+        and
+        re.search(
+            rf"\b(?:{STREET_TYPES})\b",
+            cleaned,
+            re.IGNORECASE
+        )
+    )
+
+
+def looks_like_suburb(line):
+    return bool(
+        re.search(
+            r"\bNSW\s+\d{4}\b",
+            line,
+            re.IGNORECASE
+        )
+    )
+
+
+def parse_suburb(line):
+    match = re.search(
+        r"([A-Za-z][A-Za-z\s'\-]+?)"
+        r"\s+NSW\s+(\d{4})",
+        line,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return "", ""
+
+    suburb = match.group(1).strip()
+    postcode = match.group(2).strip()
+
+    # Remove OCR junk before the suburb.
+    suburb = re.sub(
+        r"[^A-Za-z\s'\-]",
+        "",
+        suburb
+    ).strip()
+
+    return suburb, postcode
+
+
+def derive_street(address):
+    address = clean_address_line(
+        address
+    )
+
+    if not address:
+        return ""
+
+    street = re.sub(
+        r"^\s*(?:Unit\s*)?"
+        r"\d+[A-Za-z]?"
+        r"(?:\s*/\s*\d+[A-Za-z\-]*)?"
+        r"\s+",
+        "",
+        address,
+        flags=re.IGNORECASE
+    )
+
+    return street.strip()
+
+
+# ============================================================
 # RESET SCHEDULE
 # ============================================================
 
@@ -395,15 +560,13 @@ def reset_schedule():
     st.session_state.extracted_jobs = []
     st.session_state.analysed_jobs = []
     st.session_state.analysis_summary = {}
-    st.session_state.generated_report = ""
+    st.session_state.generated_pdf = None
     st.session_state.analysis_date = date.today()
-
-    # Changing the widget key destroys the old upload widget.
     st.session_state.schedule_uploader_key += 1
 
 
 # ============================================================
-# PROPERTY REPORTS
+# PROPERTY DATA
 # ============================================================
 
 def save_visit(
@@ -416,7 +579,6 @@ def save_visit(
     conditions,
     notes
 ):
-
     total_delay = sum(
         condition["delay_minutes"]
         for condition in conditions
@@ -438,8 +600,8 @@ def save_visit(
     """, (
         datetime.now().isoformat(),
         visit_date.isoformat(),
-        address.strip(),
-        street.strip(),
+        clean_address_line(address),
+        street,
         suburb.strip(),
         profile_level,
         int(no_difficulty),
@@ -450,7 +612,6 @@ def save_visit(
     visit_id = cursor.lastrowid
 
     for condition in conditions:
-
         execute("""
             INSERT INTO conditions (
                 visit_id,
@@ -512,24 +673,19 @@ def get_conditions():
 
 
 # ============================================================
-# PROPERTY PATTERN ENGINE
+# PATTERN ENGINE
 # ============================================================
 
 def build_patterns():
-
     rows = get_conditions()
 
     groups = {}
 
     for row in rows:
-
         level = row["profile_level"]
 
         if level == "Street":
-            location = (
-                row["street"]
-                or row["address"]
-            )
+            location = row["street"] or row["address"]
 
         elif level == "Area":
             location = row["suburb"]
@@ -544,7 +700,6 @@ def build_patterns():
         )
 
         if key not in groups:
-
             groups[key] = {
                 "location": location,
                 "street": row["street"],
@@ -621,10 +776,7 @@ def build_patterns():
     patterns = []
 
     for group in groups.values():
-
-        count = len(
-            group["rows"]
-        )
+        count = len(group["rows"])
 
         group["count"] = count
 
@@ -658,7 +810,6 @@ def pattern_matches_job(
     street,
     suburb
 ):
-
     if pattern["level"] == "Building":
         return (
             clean(pattern["location"])
@@ -688,7 +839,6 @@ def condition_applies(
     planned_time,
     schedule_date
 ):
-
     day_name = schedule_date.strftime(
         "%A"
     )
@@ -700,9 +850,7 @@ def condition_applies(
         return False
 
     if pattern["time_windows"]:
-
         for start, end in pattern["time_windows"]:
-
             if time_inside_window(
                 planned_time,
                 start,
@@ -721,17 +869,18 @@ def analyse_property_job(
     planned_time,
     schedule_date
 ):
+    address = clean_address_line(
+        address
+    )
 
     street = derive_street(
         address
     )
 
     matches = []
-
     predicted_delay = 0
 
     for pattern in build_patterns():
-
         if pattern["status"] not in [
             "Recognised",
             "Confirmed"
@@ -794,7 +943,6 @@ def save_agency_profile(
     notes,
     recommended_action
 ):
-
     existing = execute("""
         SELECT id
         FROM agencies
@@ -805,7 +953,6 @@ def save_agency_profile(
     )).fetchone()
 
     if existing:
-
         execute("""
             UPDATE agencies
             SET
@@ -815,7 +962,7 @@ def save_agency_profile(
                 recommended_action = ?
             WHERE id = ?
         """, (
-            address.strip(),
+            clean_address_line(address),
             suburb.strip(),
             notes.strip(),
             recommended_action,
@@ -823,7 +970,6 @@ def save_agency_profile(
         ))
 
     else:
-
         execute("""
             INSERT INTO agencies (
                 created_at,
@@ -837,7 +983,7 @@ def save_agency_profile(
         """, (
             datetime.now().isoformat(),
             agency_name.strip(),
-            address.strip(),
+            clean_address_line(address),
             suburb.strip(),
             notes.strip(),
             recommended_action
@@ -854,7 +1000,6 @@ def save_agency_delay(
     notes,
     recurring
 ):
-
     execute("""
         INSERT INTO agency_delays (
             created_at,
@@ -872,7 +1017,7 @@ def save_agency_delay(
         datetime.now().isoformat(),
         delay_date.isoformat(),
         agency_name.strip(),
-        address.strip(),
+        clean_address_line(address),
         suburb.strip(),
         reason,
         delay_minutes,
@@ -885,11 +1030,9 @@ def get_agency_intelligence(
     agency_name,
     address=""
 ):
-
     profile = None
 
     if agency_name:
-
         profile = execute("""
             SELECT *
             FROM agencies
@@ -902,7 +1045,6 @@ def get_agency_intelligence(
     delays = []
 
     if agency_name:
-
         delays = execute("""
             SELECT *
             FROM agency_delays
@@ -913,14 +1055,13 @@ def get_agency_intelligence(
         )).fetchall()
 
     if not delays and address:
-
         delays = execute("""
             SELECT *
             FROM agency_delays
             WHERE lower(address) = lower(?)
             ORDER BY delay_date DESC
         """, (
-            address.strip(),
+            clean_address_line(address),
         )).fetchall()
 
     delay_values = [
@@ -967,7 +1108,6 @@ def get_agency_intelligence(
 
 
 def analyse_agency_stop(job):
-
     intelligence = get_agency_intelligence(
         job["agency_name"],
         job["address"]
@@ -1005,7 +1145,6 @@ def analyse_agency_stop(job):
 # ============================================================
 
 def preprocess_image(uploaded_file):
-
     image = Image.open(
         uploaded_file
     )
@@ -1015,7 +1154,6 @@ def preprocess_image(uploaded_file):
     width, height = image.size
 
     if width < 1800:
-
         scale = 1800 / width
 
         image = image.resize(
@@ -1027,13 +1165,12 @@ def preprocess_image(uploaded_file):
 
     image = ImageEnhance.Contrast(
         image
-    ).enhance(1.5)
+    ).enhance(1.6)
 
     return image
 
 
 def extract_text(uploaded_file):
-
     image = preprocess_image(
         uploaded_file
     )
@@ -1045,127 +1182,14 @@ def extract_text(uploaded_file):
 
 
 # ============================================================
-# SIMPLIFIED OCR PARSER
+# V3.3 OCR PARSER
 # ============================================================
 
-STREET_PATTERN = (
-    r"Street|St|Road|Rd|Avenue|Ave|Parade|Pde|"
-    r"Drive|Dr|Lane|Ln|Way|Crescent|Cres|Circuit|"
-    r"Boulevard|Place|Pl|Close|Court|Ct|Terrace|"
-    r"Highway|Hwy"
-)
-
-
-def looks_like_address(line):
-
-    return bool(
-        re.search(r"\d", line)
-        and
-        re.search(
-            rf"\b(?:{STREET_PATTERN})\b",
-            line,
-            re.IGNORECASE
-        )
-    )
-
-
-def looks_like_suburb(line):
-
-    return bool(
-        re.search(
-            r"\bNSW\s+\d{4}\b",
-            line,
-            re.IGNORECASE
-        )
-    )
-
-
-def parse_suburb(line):
-
-    match = re.search(
-        r"([A-Za-z][A-Za-z\s'\-]+?)\s+NSW\s+(\d{4})",
-        line,
-        re.IGNORECASE
-    )
-
-    if not match:
-        return "", ""
-
-    return (
-        match.group(1).strip(),
-        match.group(2)
-    )
-
-
-def derive_street(address):
-
-    if not address:
-        return ""
-
-    street = re.sub(
-        r"^\s*(?:Unit\s*)?"
-        r"\d+[A-Za-z]?"
-        r"(?:\s*/\s*\d+[A-Za-z\-]*)?"
-        r"\s+",
-        "",
-        address,
-        flags=re.IGNORECASE
-    )
-
-    return street.strip()
-
-
-def find_time_in_block(lines):
-
-    # Prefer lines mentioning anticipated time.
-    for line in lines:
-
-        if (
-            "anticipated"
-            in line.lower()
-        ):
-
-            match = re.search(
-                r"\b([0-1]?\d:[0-5]\d)\s*([AaPp][Mm])?\b",
-                line
-            )
-
-            if match:
-
-                raw = match.group(0)
-
-                if match.group(2):
-                    return normalise_time(
-                        raw
-                    )
-
-                return normalise_time(
-                    raw
-                )
-
-    # Fallback to first obvious time.
-    for line in lines:
-
-        match = re.search(
-            r"\b([0-1]?\d:[0-5]\d)\s*([AaPp][Mm])\b",
-            line
-        )
-
-        if match:
-            return normalise_time(
-                match.group(0)
-            )
-
-    return ""
-
-
 def find_job_id(lines):
-
     text = "\n".join(lines)
 
     match = re.search(
-        r"(?:Job\s*(?:ID|Id|#)?[:\s]*)"
-        r"(\d{5,})",
+        r"Job\s*(?:ID|Id|#)?\s*:?\s*(\d{5,})",
         text,
         re.IGNORECASE
     )
@@ -1177,66 +1201,108 @@ def find_job_id(lines):
 
 
 def detect_stop_type(lines):
-
-    text = " ".join(
-        lines
-    ).lower()
+    text = " ".join(lines).lower()
 
     if (
         "agency pickup" in text
-        or
-        "agency pick up" in text
-        or
-        "key pickup" in text
-        or
-        "key pick up" in text
+        or "agency pick up" in text
+        or "key pickup" in text
+        or "key pick up" in text
     ):
         return "Agency Pickup"
 
     if (
         "agency dropoff" in text
-        or
-        "agency drop off" in text
-        or
-        "key dropoff" in text
-        or
-        "key drop off" in text
+        or "agency drop off" in text
+        or "key dropoff" in text
+        or "key drop off" in text
     ):
         return "Agency Drop-off"
 
     return "Job"
 
 
-def find_agency_name(lines):
+def find_anticipated_time(lines):
+    """
+    Only uses Anticipated Appointment time / Anticipated time.
+
+    This prevents:
+        Start of Day Travel 07:15
+
+    from becoming the first property's appointment time.
+    """
 
     for index, line in enumerate(lines):
+        lower = line.lower()
 
+        if "anticipated" not in lower:
+            continue
+
+        search_lines = [
+            line
+        ]
+
+        if index + 1 < len(lines):
+            search_lines.append(
+                lines[index + 1]
+            )
+
+        if index + 2 < len(lines):
+            search_lines.append(
+                lines[index + 2]
+            )
+
+        search_text = " ".join(
+            search_lines
+        )
+
+        # Supports:
+        # 08:00
+        # 08:00:00
+        # 08:00 AM
+        match = re.search(
+            r"\b("
+            r"\d{1,2}:\d{2}(?::\d{2})?"
+            r")\s*([APap][Mm])?",
+            search_text
+        )
+
+        if match:
+            raw = match.group(1)
+
+            if match.group(2):
+                raw += " " + match.group(2)
+
+            result = normalise_time(
+                raw
+            )
+
+            if result:
+                return result
+
+    return ""
+
+
+def find_agency_name(lines):
+    for index, line in enumerate(lines):
         lower = line.lower()
 
         if (
             "agency pickup" in lower
-            or
-            "agency pick up" in lower
-            or
-            "agency dropoff" in lower
-            or
-            "agency drop off" in lower
-            or
-            "key pickup" in lower
-            or
-            "key pick up" in lower
+            or "agency pick up" in lower
+            or "agency dropoff" in lower
+            or "agency drop off" in lower
+            or "key pickup" in lower
+            or "key pick up" in lower
         ):
-
-            # Usually the agency name follows the label.
             for candidate in lines[
-                index + 1:
-                index + 4
+                index + 1:index + 4
             ]:
-
                 if (
                     candidate
                     and not looks_like_address(candidate)
                     and not looks_like_suburb(candidate)
+                    and "anticipated" not in candidate.lower()
                 ):
                     return candidate.strip()
 
@@ -1244,35 +1310,47 @@ def find_agency_name(lines):
 
 
 def extract_schedule_from_text(text):
-
     raw_lines = [
-        re.sub(r"\s+", " ", line).strip()
+        re.sub(
+            r"\s+",
+            " ",
+            line
+        ).strip()
         for line in text.splitlines()
         if line.strip()
     ]
 
-    jobs = []
+    stops = []
 
-    address_indexes = [
-        index
-        for index, line in enumerate(raw_lines)
-        if looks_like_address(line)
-    ]
+    # --------------------------------------------------------
+    # PROPERTY JOBS
+    # --------------------------------------------------------
 
-    for address_index in address_indexes:
+    for index, line in enumerate(raw_lines):
+        if not looks_like_address(line):
+            continue
 
-        address = raw_lines[
-            address_index
-        ]
+        address = clean_address_line(
+            line
+        )
+
+        # Don't use the same address twice.
+        if any(
+            clean(stop["address"])
+            ==
+            clean(address)
+            for stop in stops
+        ):
+            continue
 
         start = max(
             0,
-            address_index - 6
+            index - 3
         )
 
         end = min(
             len(raw_lines),
-            address_index + 8
+            index + 12
         )
 
         block = raw_lines[
@@ -1286,39 +1364,34 @@ def extract_schedule_from_text(text):
         suburb = ""
         postcode = ""
 
-        # Prefer suburb line immediately after address.
         for candidate in raw_lines[
-            address_index + 1:
-            address_index + 4
+            index + 1:index + 4
         ]:
-
-            if looks_like_suburb(
-                candidate
-            ):
+            if looks_like_suburb(candidate):
                 suburb, postcode = parse_suburb(
                     candidate
                 )
                 break
 
-        planned_time = find_time_in_block(
+        planned_time = find_anticipated_time(
             block
         )
-
-        job_id = ""
-
-        agency_name = ""
 
         if stop_type == "Job":
             job_id = find_job_id(
                 block
             )
 
+            agency_name = ""
+
         else:
+            job_id = ""
+
             agency_name = find_agency_name(
                 block
             )
 
-        candidate = {
+        stops.append({
             "position": 0,
             "stop_type": stop_type,
             "job_id": job_id,
@@ -1327,109 +1400,343 @@ def extract_schedule_from_text(text):
             "suburb": suburb,
             "postcode": postcode,
             "planned_time": planned_time
-        }
+        })
 
-        duplicate = any(
-            clean(existing["address"])
-            ==
-            clean(candidate["address"])
-            for existing in jobs
-        )
+    # --------------------------------------------------------
+    # SORT
+    # --------------------------------------------------------
 
-        if not duplicate:
-            jobs.append(candidate)
-
-    # Sort where times are available.
-    def sort_key(job):
-
-        if job["planned_time"]:
-
+    def sort_key(stop):
+        if stop["planned_time"]:
             try:
                 return datetime.strptime(
-                    job["planned_time"],
+                    stop["planned_time"],
                     "%H:%M"
                 ).time()
-
             except:
                 pass
 
         return time(23, 59)
 
-    jobs.sort(
+    stops.sort(
         key=sort_key
     )
 
-    for index, job in enumerate(
-        jobs,
+    for position, stop in enumerate(
+        stops,
         start=1
     ):
-        job["position"] = index
+        stop["position"] = position
 
-    return jobs
+    return stops
 
 
 # ============================================================
-# PREDICTIVE REPORT
+# PDF GENERATOR
 # ============================================================
 
-def generate_predictive_report(
+def generate_predictive_pdf(
     schedule_date,
     analysed_jobs,
     summary
 ):
+    buffer = BytesIO()
 
-    generated = datetime.now()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=16 * mm,
+        bottomMargin=16 * mm,
+        title="Predictive Daily Operational Report"
+    )
 
-    rows = ""
+    styles = getSampleStyleSheet()
 
-    for item in analysed_jobs:
+    title_style = ParagraphStyle(
+        "ReportTitle",
+        parent=styles["Title"],
+        fontSize=19,
+        leading=23,
+        alignment=TA_CENTER,
+        spaceAfter=8
+    )
 
+    subtitle_style = ParagraphStyle(
+        "Subtitle",
+        parent=styles["Normal"],
+        fontSize=10,
+        alignment=TA_CENTER,
+        textColor=colors.grey,
+        spaceAfter=18
+    )
+
+    heading_style = ParagraphStyle(
+        "Heading",
+        parent=styles["Heading2"],
+        fontSize=14,
+        leading=18,
+        spaceBefore=10,
+        spaceAfter=8
+    )
+
+    body_style = ParagraphStyle(
+        "Body",
+        parent=styles["BodyText"],
+        fontSize=10,
+        leading=14
+    )
+
+    small_style = ParagraphStyle(
+        "Small",
+        parent=styles["BodyText"],
+        fontSize=8,
+        leading=11,
+        textColor=colors.grey
+    )
+
+    story = []
+
+    story.append(
+        Paragraph(
+            "Building Difficulty Intelligence",
+            title_style
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "Predictive Daily Operational Report",
+            subtitle_style
+        )
+    )
+
+    story.append(
+        Paragraph(
+            schedule_date.strftime(
+                "%A %d %B %Y"
+            ),
+            styles["Heading1"]
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "Generated before day progression: "
+            + datetime.now().strftime(
+                "%d %B %Y at %I:%M %p"
+            ),
+            body_style
+        )
+    )
+
+    story.append(
+        Spacer(
+            1,
+            10
+        )
+    )
+
+    summary_data = [
+        [
+            "Scheduled Stops",
+            "Service Jobs",
+            "Flagged Stops",
+            "Predicted Delay"
+        ],
+        [
+            str(summary["total_stops"]),
+            str(summary["total_jobs"]),
+            str(summary["flagged_stops"]),
+            f"+{round(summary['predicted_delay'])} min"
+        ]
+    ]
+
+    summary_table = Table(
+        summary_data,
+        colWidths=[
+            42 * mm,
+            42 * mm,
+            42 * mm,
+            42 * mm
+        ]
+    )
+
+    summary_table.setStyle(
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.lightgrey
+            ),
+            (
+                "FONTNAME",
+                (0, 0),
+                (-1, 0),
+                "Helvetica-Bold"
+            ),
+            (
+                "ALIGN",
+                (0, 0),
+                (-1, -1),
+                "CENTER"
+            ),
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.grey
+            ),
+            (
+                "TOPPADDING",
+                (0, 0),
+                (-1, -1),
+                7
+            ),
+            (
+                "BOTTOMPADDING",
+                (0, 0),
+                (-1, -1),
+                7
+            )
+        ])
+    )
+
+    story.append(
+        summary_table
+    )
+
+    story.append(
+        Spacer(
+            1,
+            18
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "Predicted Difficulties",
+            heading_style
+        )
+    )
+
+    flagged_items = [
+        item
+        for item in analysed_jobs
+        if item["result"]["predicted_delay"] > 0
+    ]
+
+    if not flagged_items:
+        story.append(
+            Paragraph(
+                "No recognised predictive delays were "
+                "identified for this schedule at the "
+                "time of analysis.",
+                body_style
+            )
+        )
+
+    for item in flagged_items:
         job = item["job"]
         result = item["result"]
 
-        if result["predicted_delay"] <= 0:
-            continue
+        if job["stop_type"] == "Job":
+            name = job["address"]
 
-        reasons = []
+        else:
+            name = (
+                job["agency_name"]
+                or job["address"]
+            )
+
+        story.append(
+            Paragraph(
+                f"<b>Stop {job['position']} — "
+                f"{format_time(job['planned_time'])}</b>",
+                styles["Heading3"]
+            )
+        )
+
+        story.append(
+            Paragraph(
+                f"{job['stop_type']}<br/>"
+                f"{name}<br/>"
+                f"{job['suburb']} {job['postcode']}",
+                body_style
+            )
+        )
+
+        story.append(
+            Paragraph(
+                f"<b>Predicted additional time: "
+                f"+{round(result['predicted_delay'])} minutes</b>",
+                body_style
+            )
+        )
 
         if job["stop_type"] == "Job":
-
             for pattern in result["patterns"]:
-
-                reason = (
+                text = (
                     f"{pattern['condition_type']} — "
                     f"{pattern['count']} previous report(s), "
                     f"{pattern['confidence']} confidence"
                 )
 
                 if pattern["median_delay"]:
-
-                    reason += (
+                    text += (
                         f", historical median "
                         f"+{round(pattern['median_delay'])} min"
                     )
 
-                reasons.append(reason)
+                story.append(
+                    Paragraph(
+                        "• " + text,
+                        body_style
+                    )
+                )
+
+                for solution in pattern["solutions"]:
+                    story.append(
+                        Paragraph(
+                            f"Recommended action: {solution}",
+                            body_style
+                        )
+                    )
+
+                for note in pattern["solution_notes"]:
+                    story.append(
+                        Paragraph(
+                            f"Field note: {note}",
+                            body_style
+                        )
+                    )
 
         else:
-
-            intel = result[
+            intelligence = result[
                 "intelligence"
             ]
 
-            for reason in intel["reasons"]:
-                reasons.append(
-                    reason
+            for reason in intelligence["reasons"]:
+                story.append(
+                    Paragraph(
+                        "• " + reason,
+                        body_style
+                    )
                 )
 
-            profile = intel["profile"]
+            profile = intelligence["profile"]
 
             if profile:
-
                 if profile["notes"]:
-                    reasons.append(
-                        "Field note: "
-                        + profile["notes"]
+                    story.append(
+                        Paragraph(
+                            "Field note: "
+                            + profile["notes"],
+                            body_style
+                        )
                     )
 
                 if (
@@ -1437,203 +1744,83 @@ def generate_predictive_report(
                     and profile["recommended_action"]
                     != "None"
                 ):
-                    reasons.append(
-                        "Recommended action: "
-                        + profile["recommended_action"]
+                    story.append(
+                        Paragraph(
+                            "Recommended action: "
+                            + profile[
+                                "recommended_action"
+                            ],
+                            body_style
+                        )
                     )
 
-        reason_html = "<br>".join(
-            html.escape(reason)
-            for reason in reasons
+        story.append(
+            Spacer(
+                1,
+                12
+            )
         )
 
-        name = (
-            job["agency_name"]
-            if job["stop_type"] != "Job"
-            and job["agency_name"]
-            else job["address"]
+    story.append(
+        Spacer(
+            1,
+            20
         )
+    )
 
-        rows += f"""
-        <div class="flag">
-            <h3>
-                {html.escape(result["icon"])}
-                Stop {job["position"]} —
-                {html.escape(format_time(job["planned_time"]))}
-            </h3>
+    story.append(
+        Paragraph(
+            "Evidence statement",
+            heading_style
+        )
+    )
 
-            <p>
-                <strong>{html.escape(job["stop_type"])}</strong><br>
-                {html.escape(name)}<br>
-                {html.escape(job["address"])}<br>
-                {html.escape(job["suburb"])}
-                {html.escape(job["postcode"])}
-            </p>
+    story.append(
+        Paragraph(
+            "This report records recognised operational "
+            "difficulty patterns identified before the "
+            "scheduled day's progression. Later cancellations, "
+            "schedule changes or actual outcomes do not alter "
+            "the original prediction.",
+            body_style
+        )
+    )
 
-            <p>
-                <strong>Predicted additional time:
-                +{round(result["predicted_delay"])} minutes</strong>
-            </p>
+    story.append(
+        Spacer(
+            1,
+            12
+        )
+    )
 
-            <p>{reason_html}</p>
-        </div>
-        """
+    story.append(
+        Paragraph(
+            "Building Difficulty Intelligence — "
+            "prototype operational evidence report.",
+            small_style
+        )
+    )
 
-    if not rows:
+    doc.build(
+        story
+    )
 
-        rows = """
-        <div class="clear">
-            No recognised predictive delays were identified
-            for this schedule at the time of analysis.
-        </div>
-        """
+    pdf_bytes = buffer.getvalue()
 
-    report = f"""
-    <!DOCTYPE html>
+    buffer.close()
 
-    <html>
+    return pdf_bytes
 
-    <head>
 
-    <meta charset="UTF-8">
-
-    <title>
-        Predictive Daily Report —
-        {schedule_date.strftime("%d %B %Y")}
-    </title>
-
-    <style>
-
-    body {{
-        font-family: Arial, sans-serif;
-        margin: 40px;
-        color: #222;
-        line-height: 1.5;
-    }}
-
-    h1 {{
-        margin-bottom: 5px;
-    }}
-
-    .subtitle {{
-        color: #666;
-        margin-bottom: 30px;
-    }}
-
-    .summary {{
-        border: 1px solid #ccc;
-        padding: 20px;
-        margin-bottom: 30px;
-        border-radius: 8px;
-    }}
-
-    .flag {{
-        border-left: 5px solid #444;
-        padding: 10px 20px;
-        margin: 20px 0;
-        background: #f6f6f6;
-    }}
-
-    .clear {{
-        padding: 20px;
-        background: #f6f6f6;
-    }}
-
-    .footer {{
-        margin-top: 40px;
-        padding-top: 20px;
-        border-top: 1px solid #ccc;
-        font-size: 12px;
-        color: #666;
-    }}
-
-    </style>
-
-    </head>
-
-    <body>
-
-        <h1>
-            Building Difficulty Intelligence
-        </h1>
-
-        <div class="subtitle">
-            Predictive Daily Operational Report
-        </div>
-
-        <h2>
-            {schedule_date.strftime("%A %d %B %Y")}
-        </h2>
-
-        <p>
-            Generated:
-            {generated.strftime("%d %B %Y at %I:%M %p")}
-        </p>
-
-        <div class="summary">
-
-            <h2>Pre-Day Prediction</h2>
-
-            <p>
-                Total scheduled stops:
-                <strong>{summary["total_stops"]}</strong>
-            </p>
-
-            <p>
-                Service jobs:
-                <strong>{summary["total_jobs"]}</strong>
-            </p>
-
-            <p>
-                Stops with recognised predictive difficulty:
-                <strong>{summary["flagged_stops"]}</strong>
-            </p>
-
-            <p>
-                Predicted additional operational time:
-                <strong>
-                    +{round(summary["predicted_delay"])} minutes
-                </strong>
-            </p>
-
-        </div>
-
-        <h2>Predicted Difficulties</h2>
-
-        {rows}
-
-        <div class="footer">
-
-            This report records recognised operational
-            difficulty patterns identified before the
-            scheduled day's progression.
-
-            <br><br>
-
-            Later cancellations, schedule changes or actual
-            outcomes do not alter the original prediction.
-
-            <br><br>
-
-            Prototype operational intelligence report.
-
-        </div>
-
-    </body>
-
-    </html>
-    """
-
-    return report
-
+# ============================================================
+# SAVE PREDICTION
+# ============================================================
 
 def save_prediction_snapshot(
     schedule_date,
     analysed_jobs,
-    summary,
-    report_html
+    summary
 ):
-
     cursor = execute("""
         INSERT INTO prediction_reports (
             created_at,
@@ -1641,38 +1828,33 @@ def save_prediction_snapshot(
             total_stops,
             total_jobs,
             flagged_stops,
-            predicted_delay,
-            report_html
+            predicted_delay
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().isoformat(),
         schedule_date.isoformat(),
         summary["total_stops"],
         summary["total_jobs"],
         summary["flagged_stops"],
-        round(summary["predicted_delay"]),
-        report_html
+        round(summary["predicted_delay"])
     ))
 
     report_id = cursor.lastrowid
 
     for item in analysed_jobs:
-
         job = item["job"]
         result = item["result"]
 
         reasons = []
 
         if job["stop_type"] == "Job":
-
             reasons = [
                 pattern["condition_type"]
                 for pattern in result["patterns"]
             ]
 
         else:
-
             reasons = result[
                 "intelligence"
             ]["reasons"]
@@ -1716,7 +1898,6 @@ def save_prediction_snapshot(
 # ============================================================
 
 def show_dashboard():
-
     st.header(
         "📊 Operational Intelligence"
     )
@@ -1767,17 +1948,17 @@ def show_dashboard():
     col1, col2, col3 = st.columns(3)
 
     col1.metric(
-        "🆕 New Delays This Week",
+        "🆕 New Delays",
         len(new_delays)
     )
 
     col2.metric(
-        "🔁 New Recurring Patterns",
+        "🔁 New Patterns",
         len(recurring)
     )
 
     col3.metric(
-        "🕐 Scheduling Patterns",
+        "🕐 Scheduling",
         len(scheduling)
     )
 
@@ -1799,7 +1980,7 @@ def show_dashboard():
     """).fetchone()
 
     col3.metric(
-        "📄 Predictive Reports",
+        "📄 Predictions",
         reports["count"]
     )
 
@@ -1808,13 +1989,11 @@ def show_dashboard():
     )
 
     if not new_delays:
-
         st.info(
             "No new property difficulty intelligence this week."
         )
 
     for pattern in new_delays[:8]:
-
         st.write(
             f"**{pattern['location']}**"
         )
@@ -1825,7 +2004,6 @@ def show_dashboard():
         )
 
         if pattern["median_delay"]:
-
             st.caption(
                 f"Typical delay "
                 f"+{round(pattern['median_delay'])} min"
@@ -1835,11 +2013,10 @@ def show_dashboard():
 
 
 # ============================================================
-# REPORT DIFFICULTY
+# REPORT PAGE
 # ============================================================
 
 def show_report_page():
-
     st.header(
         "➕ Report Delay"
     )
@@ -1855,12 +2032,7 @@ def show_report_page():
 
     st.divider()
 
-    # --------------------------------------------------------
-    # PROPERTY
-    # --------------------------------------------------------
-
     if report_type == "🏢 Property / Building":
-
         visit_date = st.date_input(
             "Visit date",
             date.today()
@@ -1893,7 +2065,6 @@ def show_report_page():
         )
 
         if not no_difficulty:
-
             category_choice = st.radio(
                 "Delay type",
                 [
@@ -1904,7 +2075,6 @@ def show_report_page():
             )
 
             if category_choice == "Scheduling":
-
                 category = "Scheduling"
 
                 condition_type = st.selectbox(
@@ -1913,7 +2083,6 @@ def show_report_page():
                 )
 
             else:
-
                 category = "Site"
 
                 condition_type = st.selectbox(
@@ -1943,7 +2112,6 @@ def show_report_page():
             end_value = None
 
             if applicability == "Certain days and times":
-
                 selected_days = st.multiselect(
                     "Days",
                     DAYS,
@@ -1951,18 +2119,15 @@ def show_report_page():
                 )
 
             if applicability != "Always":
-
                 col1, col2 = st.columns(2)
 
                 with col1:
-
                     start_time = st.time_input(
                         "From",
                         time(8, 0)
                     )
 
                 with col2:
-
                     end_time = st.time_input(
                         "Until",
                         time(13, 0)
@@ -1988,13 +2153,8 @@ def show_report_page():
             solution_notes = ""
 
             if solution != "None":
-
                 solution_notes = st.text_input(
-                    "Solution / field note",
-                    placeholder=(
-                        "Example: concierge can reserve "
-                        "loading bay if called first"
-                    )
+                    "Solution / field note"
                 )
 
             concierge = solution in [
@@ -2006,7 +2166,6 @@ def show_report_page():
                 "➕ Add Delay",
                 use_container_width=True
             ):
-
                 st.session_state.conditions.append({
                     "category": category,
                     "condition_type": condition_type,
@@ -2025,7 +2184,6 @@ def show_report_page():
                 st.rerun()
 
         if st.session_state.conditions:
-
             st.subheader(
                 "Current report"
             )
@@ -2033,7 +2191,6 @@ def show_report_page():
             for index, condition in enumerate(
                 st.session_state.conditions
             ):
-
                 st.write(
                     f"**{condition['condition_type']}** "
                     f"— {condition['delay_minutes']} min"
@@ -2043,7 +2200,6 @@ def show_report_page():
                     "Remove",
                     key=f"remove_{index}"
                 ):
-
                     st.session_state.conditions.pop(
                         index
                     )
@@ -2059,9 +2215,7 @@ def show_report_page():
             type="primary",
             use_container_width=True
         ):
-
             if not address.strip():
-
                 st.error(
                     "Enter the job address."
                 )
@@ -2070,13 +2224,11 @@ def show_report_page():
                 not no_difficulty
                 and not st.session_state.conditions
             ):
-
                 st.error(
                     "Add a delay first."
                 )
 
             else:
-
                 save_visit(
                     visit_date,
                     address,
@@ -2094,12 +2246,7 @@ def show_report_page():
                     "Property report saved."
                 )
 
-    # --------------------------------------------------------
-    # AGENCY
-    # --------------------------------------------------------
-
     else:
-
         delay_date = st.date_input(
             "Date",
             date.today(),
@@ -2107,8 +2254,7 @@ def show_report_page():
         )
 
         agency_name = st.text_input(
-            "Agency name",
-            placeholder="Example: Ausrealty Campbelltown"
+            "Agency name"
         )
 
         address = st.text_input(
@@ -2137,10 +2283,6 @@ def show_report_page():
             "Known recurring agency delay"
         )
 
-        st.subheader(
-            "Agency intelligence"
-        )
-
         general_note = st.text_area(
             "Field note",
             placeholder=(
@@ -2154,17 +2296,12 @@ def show_report_page():
         )
 
         if recommended_action == "Other":
-
             recommended_action = st.text_input(
                 "Recommended action details"
             )
 
         delay_note = st.text_area(
-            "This visit notes",
-            placeholder=(
-                "Example: waited 12 minutes for keys "
-                "to be located."
-            )
+            "This visit notes"
         )
 
         if st.button(
@@ -2172,15 +2309,12 @@ def show_report_page():
             type="primary",
             use_container_width=True
         ):
-
             if not agency_name.strip():
-
                 st.error(
                     "Enter the agency name."
                 )
 
             else:
-
                 save_agency_profile(
                     agency_name,
                     address,
@@ -2210,7 +2344,6 @@ def show_report_page():
 # ============================================================
 
 def show_schedule_page():
-
     st.header(
         "📸 Daily Schedule Prediction"
     )
@@ -2220,9 +2353,8 @@ def show_schedule_page():
     # --------------------------------------------------------
 
     if st.session_state.schedule_stage == "upload":
-
         st.caption(
-            "Upload the Field screenshots for the day."
+            "Upload today's Field screenshots."
         )
 
         schedule_date = st.date_input(
@@ -2248,7 +2380,6 @@ def show_schedule_page():
         )
 
         if screenshots:
-
             st.success(
                 f"{len(screenshots)} screenshot(s) ready."
             )
@@ -2258,7 +2389,6 @@ def show_schedule_page():
                 type="primary",
                 use_container_width=True
             ):
-
                 combined_jobs = []
 
                 progress = st.progress(0)
@@ -2266,11 +2396,9 @@ def show_schedule_page():
                 for index, screenshot in enumerate(
                     screenshots
                 ):
-
                     with st.spinner(
                         f"Reading screenshot {index + 1}..."
                     ):
-
                         text = extract_text(
                             screenshot
                         )
@@ -2280,7 +2408,6 @@ def show_schedule_page():
                         )
 
                         for job in jobs:
-
                             duplicate = any(
                                 clean(existing["address"])
                                 ==
@@ -2299,9 +2426,7 @@ def show_schedule_page():
                         len(screenshots)
                     )
 
-                # Sort all screenshots together.
                 def job_sort(job):
-
                     try:
                         return datetime.strptime(
                             job["planned_time"],
@@ -2340,19 +2465,17 @@ def show_schedule_page():
     # --------------------------------------------------------
 
     elif st.session_state.schedule_stage == "review":
-
         jobs = st.session_state.extracted_jobs
 
         st.subheader(
-            "Review"
+            "Review Extracted Schedule"
         )
 
         st.caption(
-            "Only correct anything the screenshot reader got wrong."
+            "Only correct anything the reader got wrong."
         )
 
         if not jobs:
-
             st.error(
                 "No schedule stops were detected."
             )
@@ -2361,7 +2484,6 @@ def show_schedule_page():
                 "🔄 Try Again",
                 use_container_width=True
             ):
-
                 reset_schedule()
                 st.rerun()
 
@@ -2374,7 +2496,6 @@ def show_schedule_page():
         reviewed = []
 
         for index, job in enumerate(jobs):
-
             icon = (
                 "🔑"
                 if job["stop_type"] != "Job"
@@ -2395,32 +2516,28 @@ def show_schedule_page():
                 f"{format_time(job['planned_time'])} — "
                 f"{title_name}"
             ):
+                stop_options = [
+                    "Job",
+                    "Agency Pickup",
+                    "Agency Drop-off"
+                ]
 
                 stop_type = st.selectbox(
                     "Type",
-                    [
-                        "Job",
-                        "Agency Pickup",
-                        "Agency Drop-off"
-                    ],
+                    stop_options,
                     index=(
-                        [
-                            "Job",
-                            "Agency Pickup",
-                            "Agency Drop-off"
-                        ].index(job["stop_type"])
-                        if job["stop_type"] in [
-                            "Job",
-                            "Agency Pickup",
-                            "Agency Drop-off"
-                        ]
+                        stop_options.index(
+                            job["stop_type"]
+                        )
+                        if job["stop_type"]
+                        in stop_options
                         else 0
                     ),
                     key=f"type_{index}"
                 )
 
                 planned_time = st.text_input(
-                    "Time",
+                    "Anticipated time",
                     value=job["planned_time"],
                     key=f"time_{index}"
                 )
@@ -2444,11 +2561,9 @@ def show_schedule_page():
                 )
 
                 agency_name = job["agency_name"]
-
                 job_id = job["job_id"]
 
                 if stop_type == "Job":
-
                     job_id = st.text_input(
                         "Job ID",
                         value=job_id,
@@ -2458,7 +2573,6 @@ def show_schedule_page():
                     agency_name = ""
 
                 else:
-
                     agency_name = st.text_input(
                         "Agency",
                         value=agency_name,
@@ -2468,23 +2582,26 @@ def show_schedule_page():
                     job_id = ""
 
                 include = st.checkbox(
-                    "Include",
+                    "Include this stop",
                     value=True,
                     key=f"include_{index}"
                 )
 
                 if include:
-
                     reviewed.append({
                         "position": len(reviewed) + 1,
                         "stop_type": stop_type,
                         "job_id": job_id,
                         "agency_name": agency_name,
-                        "address": address,
+                        "address": clean_address_line(
+                            address
+                        ),
                         "suburb": suburb,
                         "postcode": postcode,
                         "planned_time": (
-                            normalise_time(planned_time)
+                            normalise_time(
+                                planned_time
+                            )
                             or planned_time
                         )
                     })
@@ -2492,23 +2609,19 @@ def show_schedule_page():
         col1, col2 = st.columns(2)
 
         with col1:
-
             if st.button(
                 "🔄 Reset",
                 use_container_width=True
             ):
-
                 reset_schedule()
                 st.rerun()
 
         with col2:
-
             if st.button(
                 "🧠 Analyse Day",
                 type="primary",
                 use_container_width=True
             ):
-
                 analysed = []
 
                 total_delay = 0
@@ -2516,9 +2629,7 @@ def show_schedule_page():
                 total_jobs = 0
 
                 for job in reviewed:
-
                     if job["stop_type"] == "Job":
-
                         total_jobs += 1
 
                         result = analyse_property_job(
@@ -2529,7 +2640,6 @@ def show_schedule_page():
                         )
 
                     else:
-
                         result = analyse_agency_stop(
                             job
                         )
@@ -2553,17 +2663,16 @@ def show_schedule_page():
                     "predicted_delay": total_delay
                 }
 
-                report = generate_predictive_report(
+                save_prediction_snapshot(
                     st.session_state.analysis_date,
                     analysed,
                     summary
                 )
 
-                save_prediction_snapshot(
+                pdf = generate_predictive_pdf(
                     st.session_state.analysis_date,
                     analysed,
-                    summary,
-                    report
+                    summary
                 )
 
                 st.session_state.analysed_jobs = (
@@ -2574,11 +2683,10 @@ def show_schedule_page():
                     summary
                 )
 
-                st.session_state.generated_report = (
-                    report
+                st.session_state.generated_pdf = (
+                    pdf
                 )
 
-                # Review cards disappear.
                 st.session_state.schedule_stage = (
                     "analysis"
                 )
@@ -2590,7 +2698,6 @@ def show_schedule_page():
     # --------------------------------------------------------
 
     elif st.session_state.schedule_stage == "analysis":
-
         summary = st.session_state.analysis_summary
 
         analysed = st.session_state.analysed_jobs
@@ -2623,14 +2730,12 @@ def show_schedule_page():
         )
 
         if summary["flagged_stops"]:
-
             st.warning(
                 "Recognised operational difficulties "
                 "exist in this schedule."
             )
 
         else:
-
             st.success(
                 "No recognised predictive delays "
                 "were identified."
@@ -2641,17 +2746,13 @@ def show_schedule_page():
         )
 
         for item in analysed:
-
             job = item["job"]
-
             result = item["result"]
 
             if job["stop_type"] == "Job":
-
                 name = job["address"]
 
             else:
-
                 name = (
                     job["agency_name"]
                     or job["address"]
@@ -2667,78 +2768,52 @@ def show_schedule_page():
                 job["stop_type"]
             )
 
-            if result["predicted_delay"]:
+            if job["suburb"]:
+                st.caption(
+                    f"{job['suburb']} "
+                    f"{job['postcode']}"
+                )
 
+            if result["predicted_delay"]:
                 st.write(
                     f"Predicted additional time: "
                     f"**+{round(result['predicted_delay'])} min**"
                 )
 
             if job["stop_type"] == "Job":
-
                 for pattern in result["patterns"]:
-
                     st.write(
                         f"• {pattern['condition_type']} "
                         f"— {pattern['status']}"
                     )
 
-                    if pattern["time_windows"]:
-
-                        for start, end in pattern["time_windows"]:
-
-                            st.caption(
-                                f"Applies "
-                                f"{format_time(start)} – "
-                                f"{format_time(end)}"
-                            )
-
                     for solution in pattern["solutions"]:
-
                         if "Concierge" in solution:
-
                             st.success(
                                 f"🛎️ {solution}"
                             )
 
                         else:
-
                             st.info(
                                 f"💡 {solution}"
                             )
 
                     for note in pattern["solution_notes"]:
-
                         st.caption(
                             f"Field note: {note}"
                         )
 
             else:
-
                 intelligence = result[
                     "intelligence"
                 ]
-
-                if intelligence["recognised"]:
-
-                    st.write(
-                        f"• {intelligence['count']} "
-                        f"previous agency delay report(s)"
-                    )
-
-                    st.write(
-                        f"• {intelligence['confidence']} "
-                        f"confidence"
-                    )
 
                 profile = intelligence[
                     "profile"
                 ]
 
                 if profile:
-
                     if profile["notes"]:
-
                         st.info(
                             f"📝 {profile['notes']}"
                         )
@@ -2748,7 +2823,6 @@ def show_schedule_page():
                         and profile["recommended_action"]
                         != "None"
                     ):
-
                         st.success(
                             f"💡 "
                             f"{profile['recommended_action']}"
@@ -2756,24 +2830,46 @@ def show_schedule_page():
 
             st.divider()
 
+        # ----------------------------------------------------
+        # PDF
+        # ----------------------------------------------------
+
+        st.subheader(
+            "📄 Evidence Report"
+        )
+
         filename = (
             "predictive_report_"
             + st.session_state.analysis_date.isoformat()
-            + ".html"
+            + ".pdf"
         )
 
         st.download_button(
-            "📄 Download Predictive Report",
-            data=st.session_state.generated_report,
+            "📄 Open / Save Predictive PDF",
+            data=st.session_state.generated_pdf,
             file_name=filename,
-            mime="text/html",
+            mime="application/pdf",
             use_container_width=True
         )
 
         st.caption(
-            "This is the pre-day snapshot. "
-            "Later cancellations or schedule changes "
-            "do not alter the saved prediction."
+            "On iPhone, open the PDF and use Share to "
+            "Mail it or Save to Files."
+        )
+
+        default_email = get_setting(
+            "report_email"
+        )
+
+        if default_email:
+            st.info(
+                f"📧 Intended recipient: {default_email}"
+            )
+
+        st.caption(
+            "The prediction was recorded before the day's "
+            "progression. Later cancellations do not alter "
+            "the evidence snapshot."
         )
 
         if st.button(
@@ -2781,7 +2877,6 @@ def show_schedule_page():
             type="primary",
             use_container_width=True
         ):
-
             reset_schedule()
             st.rerun()
 
@@ -2791,7 +2886,6 @@ def show_schedule_page():
 # ============================================================
 
 def show_profiles():
-
     st.header(
         "🏢 Intelligence Profiles"
     )
@@ -2806,11 +2900,9 @@ def show_profiles():
     )
 
     if profile_type == "Properties":
-
         patterns = build_patterns()
 
         if not patterns:
-
             st.info(
                 "No property profiles yet."
             )
@@ -2851,7 +2943,6 @@ def show_profiles():
         )
 
         for pattern in location_patterns:
-
             st.write(
                 f"**{pattern['condition_type']}**"
             )
@@ -2876,7 +2967,6 @@ def show_profiles():
             st.divider()
 
     else:
-
         agencies = execute("""
             SELECT *
             FROM agencies
@@ -2902,7 +2992,6 @@ def show_profiles():
             )
 
         if not names:
-
             st.info(
                 "No agency profiles yet."
             )
@@ -2939,9 +3028,7 @@ def show_profiles():
         ]
 
         if profile:
-
             if profile["notes"]:
-
                 st.info(
                     f"📝 {profile['notes']}"
                 )
@@ -2951,13 +3038,11 @@ def show_profiles():
                 and profile["recommended_action"]
                 != "None"
             ):
-
                 st.success(
                     f"💡 {profile['recommended_action']}"
                 )
 
         if intelligence["recognised"]:
-
             st.warning(
                 "🔁 Recognised recurring agency delay"
             )
@@ -2968,7 +3053,6 @@ def show_profiles():
 # ============================================================
 
 def show_history():
-
     st.header(
         "📋 History"
     )
@@ -2984,11 +3068,9 @@ def show_history():
     )
 
     if history_type == "Property Reports":
-
         visits = get_visits()
 
         if not visits:
-
             st.info(
                 "No property reports yet."
             )
@@ -2996,13 +3078,11 @@ def show_history():
             return
 
         for visit in visits:
-
             with st.expander(
                 f"{visit['visit_date']} — "
                 f"{visit['address']} — "
                 f"{visit['total_delay']} min"
             ):
-
                 rows = execute("""
                     SELECT *
                     FROM conditions
@@ -3013,7 +3093,6 @@ def show_history():
                 )).fetchall()
 
                 for row in rows:
-
                     st.write(
                         f"**{row['condition_type']}** "
                         f"— {row['delay_minutes']} min"
@@ -3025,7 +3104,6 @@ def show_history():
                     )
 
     elif history_type == "Agency Delays":
-
         rows = execute("""
             SELECT *
             FROM agency_delays
@@ -3033,7 +3111,6 @@ def show_history():
         """).fetchall()
 
         if not rows:
-
             st.info(
                 "No agency delays yet."
             )
@@ -3041,13 +3118,11 @@ def show_history():
             return
 
         for row in rows:
-
             with st.expander(
                 f"{row['delay_date']} — "
                 f"{row['agency_name']} — "
                 f"{row['delay_minutes']} min"
             ):
-
                 st.write(
                     f"**Reason:** "
                     f"{row['delay_reason']}"
@@ -3059,7 +3134,6 @@ def show_history():
                     )
 
     else:
-
         reports = execute("""
             SELECT *
             FROM prediction_reports
@@ -3067,7 +3141,6 @@ def show_history():
         """).fetchall()
 
         if not reports:
-
             st.info(
                 "No predictive reports yet."
             )
@@ -3075,7 +3148,6 @@ def show_history():
             return
 
         for report in reports:
-
             generated = datetime.fromisoformat(
                 report["created_at"]
             )
@@ -3085,7 +3157,6 @@ def show_history():
                 f"{report['flagged_stops']} flagged — "
                 f"+{report['predicted_delay']} min"
             ):
-
                 st.write(
                     f"Generated "
                     f"{generated.strftime('%d %b %Y %I:%M %p')}"
@@ -3101,17 +3172,59 @@ def show_history():
                     f"+{report['predicted_delay']} min"
                 )
 
-                st.download_button(
-                    "📄 Download Original Prediction",
-                    data=report["report_html"],
-                    file_name=(
-                        f"prediction_"
-                        f"{report['schedule_date']}_"
-                        f"{report['id']}.html"
-                    ),
-                    mime="text/html",
-                    key=f"historic_report_{report['id']}"
-                )
+
+# ============================================================
+# SETTINGS PAGE
+# ============================================================
+
+def show_settings():
+    st.header(
+        "⚙️ Report Settings"
+    )
+
+    st.write(
+        "Set the email address you normally send "
+        "predictive reports to."
+    )
+
+    current_email = get_setting(
+        "report_email"
+    )
+
+    email = st.text_input(
+        "Default report email",
+        value=current_email,
+        placeholder="name@example.com"
+    )
+
+    if st.button(
+        "💾 Save Email Address",
+        type="primary",
+        use_container_width=True
+    ):
+        if email and "@" not in email:
+            st.error(
+                "Enter a valid email address."
+            )
+
+        else:
+            save_setting(
+                "report_email",
+                email
+            )
+
+            st.success(
+                "Default report email saved."
+            )
+
+    st.divider()
+
+    st.caption(
+        "The Streamlit proof-of-concept generates the PDF "
+        "locally for download/share. Direct automatic emailing "
+        "can be added when the application moves to its "
+        "production architecture."
+    )
 
 
 # ============================================================
@@ -3134,7 +3247,8 @@ page = st.radio(
         "➕ Report",
         "📸 Schedule",
         "🏢 Profiles",
-        "📋 History"
+        "📋 History",
+        "⚙️ Settings"
     ],
     horizontal=True,
     label_visibility="collapsed"
@@ -3144,25 +3258,19 @@ st.divider()
 
 
 if page == "📊 Dashboard":
-
     show_dashboard()
 
-
 elif page == "➕ Report":
-
     show_report_page()
 
-
 elif page == "📸 Schedule":
-
     show_schedule_page()
 
-
 elif page == "🏢 Profiles":
-
     show_profiles()
 
-
 elif page == "📋 History":
-
     show_history()
+
+elif page == "⚙️ Settings":
+    show_settings()
