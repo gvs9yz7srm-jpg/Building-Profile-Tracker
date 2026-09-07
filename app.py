@@ -4,12 +4,12 @@ from datetime import datetime, date, time, timedelta
 from statistics import median
 
 # ============================================================
-# BUILDING DIFFICULTY PROFILE — V2
-# Field Intelligence + Scheduling Intelligence
+# BUILDING DIFFICULTY PROFILE — V3
+# Operational Intelligence Prototype
 # ============================================================
 
 st.set_page_config(
-    page_title="Building Difficulty Profile",
+    page_title="Building Difficulty Intelligence",
     page_icon="🏢",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -17,16 +17,21 @@ st.set_page_config(
 
 DB_NAME = "building_difficulty.db"
 
+
 # ============================================================
 # DATABASE
 # ============================================================
 
 def get_connection():
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_NAME,
+        check_same_thread=False
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 conn = get_connection()
-conn.row_factory = sqlite3.Row
 
 
 def execute(query, params=()):
@@ -36,9 +41,9 @@ def execute(query, params=()):
     return cur
 
 
-# ------------------------------------------------------------
-# V2 TABLES
-# ------------------------------------------------------------
+# ============================================================
+# TABLES
+# ============================================================
 
 execute("""
 CREATE TABLE IF NOT EXISTS visits (
@@ -48,7 +53,7 @@ CREATE TABLE IF NOT EXISTS visits (
     address TEXT NOT NULL,
     street TEXT,
     suburb TEXT,
-    profile_level TEXT NOT NULL DEFAULT 'Building',
+    profile_level TEXT DEFAULT 'Building',
     no_difficulty INTEGER DEFAULT 0,
     total_delay INTEGER DEFAULT 0,
     notes TEXT
@@ -82,7 +87,41 @@ CREATE TABLE IF NOT EXISTS conditions (
 
     concierge INTEGER DEFAULT 0,
 
-    FOREIGN KEY (visit_id) REFERENCES visits(id)
+    FOREIGN KEY (visit_id)
+        REFERENCES visits(id)
+)
+""")
+
+
+execute("""
+CREATE TABLE IF NOT EXISTS schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    schedule_date TEXT NOT NULL,
+    name TEXT
+)
+""")
+
+
+execute("""
+CREATE TABLE IF NOT EXISTS schedule_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id INTEGER NOT NULL,
+
+    position INTEGER,
+
+    stop_type TEXT DEFAULT 'Job',
+
+    job_id TEXT,
+
+    address TEXT,
+    street TEXT,
+    suburb TEXT,
+
+    planned_time TEXT,
+
+    FOREIGN KEY (schedule_id)
+        REFERENCES schedules(id)
 )
 """)
 
@@ -142,18 +181,56 @@ DAYS = [
 
 
 # ============================================================
-# HELPERS
+# SESSION STATE
 # ============================================================
+
+if "conditions" not in st.session_state:
+    st.session_state.conditions = []
+
+if "schedule_jobs" not in st.session_state:
+    st.session_state.schedule_jobs = []
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def clean(value):
+
+    if value is None:
+        return ""
+
+    return str(value).strip().lower()
+
+
+def format_time(value):
+
+    if not value:
+        return ""
+
+    try:
+
+        return datetime.strptime(
+            value,
+            "%H:%M"
+        ).strftime(
+            "%I:%M %p"
+        ).lstrip("0")
+
+    except:
+
+        return value
+
 
 def severity(minutes):
 
     if minutes <= 5:
         return "Minor"
 
-    elif minutes <= 15:
+    if minutes <= 15:
         return "Moderate"
 
-    elif minutes <= 30:
+    if minutes <= 30:
         return "Significant"
 
     return "Severe"
@@ -163,68 +240,37 @@ def severity_icon(minutes):
 
     level = severity(minutes)
 
-    if level == "Minor":
-        return "🟢"
-
-    if level == "Moderate":
-        return "🟡"
-
-    if level == "Significant":
-        return "🟠"
-
-    return "🔴"
+    return {
+        "Minor": "🟢",
+        "Moderate": "🟡",
+        "Significant": "🟠",
+        "Severe": "🔴"
+    }.get(level, "⚪")
 
 
-def pattern_status(report_count, confirmed):
+def pattern_status(count, confirmed):
 
     if confirmed:
         return "Confirmed"
 
-    if report_count >= 3:
+    if count >= 3:
         return "Recognised"
 
-    if report_count == 2:
+    if count == 2:
         return "Emerging"
 
     return "Observation"
 
 
-def pattern_icon(status):
+def confidence(count):
 
-    icons = {
-        "Observation": "⚪",
-        "Emerging": "🟡",
-        "Recognised": "🟠",
-        "Confirmed": "🔴"
-    }
-
-    return icons.get(status, "⚪")
-
-
-def confidence_label(report_count):
-
-    if report_count >= 5:
+    if count >= 5:
         return "High"
 
-    if report_count >= 3:
+    if count >= 3:
         return "Moderate"
 
     return "Low"
-
-
-def format_time(value):
-
-    if not value:
-        return ""
-
-    try:
-        return datetime.strptime(
-            value,
-            "%H:%M"
-        ).strftime("%I:%M %p").lstrip("0")
-
-    except:
-        return value
 
 
 def week_start():
@@ -236,8 +282,41 @@ def week_start():
     )
 
 
+def time_inside_window(
+    planned,
+    start,
+    end
+):
+
+    if not planned or not start or not end:
+        return False
+
+    try:
+
+        p = datetime.strptime(
+            planned,
+            "%H:%M"
+        ).time()
+
+        s = datetime.strptime(
+            start,
+            "%H:%M"
+        ).time()
+
+        e = datetime.strptime(
+            end,
+            "%H:%M"
+        ).time()
+
+        return s <= p <= e
+
+    except:
+
+        return False
+
+
 # ============================================================
-# DATABASE FUNCTIONS
+# SAVE FIELD REPORT
 # ============================================================
 
 def save_visit(
@@ -252,8 +331,8 @@ def save_visit(
 ):
 
     total_delay = sum(
-        item["delay_minutes"]
-        for item in conditions
+        c["delay_minutes"]
+        for c in conditions
     )
 
     cur = execute("""
@@ -283,7 +362,7 @@ def save_visit(
 
     visit_id = cur.lastrowid
 
-    for item in conditions:
+    for c in conditions:
 
         execute("""
             INSERT INTO conditions (
@@ -302,33 +381,39 @@ def save_visit(
                 solution_notes,
                 concierge
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?
+            )
         """, (
             visit_id,
             datetime.now().isoformat(),
-            item["category"],
-            item["condition_type"],
-            item["delay_minutes"],
-            item["applicability"],
-            ",".join(item["days"]),
-            item["start_time"],
-            item["end_time"],
-            item["source_status"],
-            int(item["confirmed"]),
-            item["solution"],
-            item["solution_notes"],
-            int(item["concierge"])
+            c["category"],
+            c["condition_type"],
+            c["delay_minutes"],
+            c["applicability"],
+            ",".join(c["days"]),
+            c["start_time"],
+            c["end_time"],
+            c["source_status"],
+            int(c["confirmed"]),
+            c["solution"],
+            c["solution_notes"],
+            int(c["concierge"])
         ))
 
-    return visit_id
 
+# ============================================================
+# GET DATA
+# ============================================================
 
 def get_visits():
 
     return execute("""
         SELECT *
         FROM visits
-        ORDER BY visit_date DESC, created_at DESC
+        ORDER BY visit_date DESC,
+                 created_at DESC
     """).fetchall()
 
 
@@ -336,30 +421,20 @@ def get_conditions():
 
     return execute("""
         SELECT
-            conditions.*,
-            visits.address,
-            visits.street,
-            visits.suburb,
-            visits.profile_level,
-            visits.visit_date
-        FROM conditions
-        JOIN visits
-            ON conditions.visit_id = visits.id
-        ORDER BY conditions.created_at DESC
+            c.*,
+            v.address,
+            v.street,
+            v.suburb,
+            v.profile_level,
+            v.visit_date
+
+        FROM conditions c
+
+        JOIN visits v
+        ON c.visit_id = v.id
+
+        ORDER BY c.created_at DESC
     """).fetchall()
-
-
-def delete_visit(visit_id):
-
-    execute(
-        "DELETE FROM conditions WHERE visit_id = ?",
-        (visit_id,)
-    )
-
-    execute(
-        "DELETE FROM visits WHERE id = ?",
-        (visit_id,)
-    )
 
 
 # ============================================================
@@ -374,74 +449,117 @@ def build_patterns():
 
     for row in rows:
 
-        if row["profile_level"] == "Street":
+        level = row["profile_level"]
+
+        if level == "Street":
 
             location = (
                 row["street"]
                 or row["address"]
             )
 
+        elif level == "Area":
+
+            location = row["suburb"]
+
         else:
 
             location = row["address"]
 
         key = (
-            location.strip().lower(),
-            row["condition_type"]
+            clean(location),
+            row["condition_type"],
+            level
         )
 
         if key not in groups:
 
             groups[key] = {
+
                 "location": location,
+
+                "street": row["street"],
+
                 "suburb": row["suburb"],
-                "profile_level": row["profile_level"],
-                "condition_type": row["condition_type"],
-                "category": row["category"],
-                "reports": [],
+
+                "level": level,
+
+                "condition_type":
+                    row["condition_type"],
+
+                "category":
+                    row["category"],
+
+                "rows": [],
+
                 "delays": [],
+
                 "confirmed": False,
+
                 "solutions": set(),
+
+                "solution_notes": set(),
+
                 "concierge": False,
-                "applicability": set(),
-                "days": set(),
+
                 "time_windows": set(),
-                "first_seen": row["visit_date"],
-                "last_seen": row["visit_date"]
+
+                "days": set(),
+
+                "first_seen":
+                    row["visit_date"],
+
+                "last_seen":
+                    row["visit_date"]
             }
 
         group = groups[key]
 
-        group["reports"].append(row)
+        group["rows"].append(row)
 
         if row["delay_minutes"] > 0:
+
             group["delays"].append(
                 row["delay_minutes"]
             )
 
         if row["manually_confirmed"]:
+
             group["confirmed"] = True
 
-        if row["solution"] and row["solution"] != "None":
+        if (
+            row["solution"]
+            and
+            row["solution"] != "None"
+        ):
+
             group["solutions"].add(
                 row["solution"]
             )
 
-        if row["concierge"]:
-            group["concierge"] = True
+        if row["solution_notes"]:
 
-        group["applicability"].add(
-            row["applicability"]
-        )
+            group["solution_notes"].add(
+                row["solution_notes"]
+            )
+
+        if row["concierge"]:
+
+            group["concierge"] = True
 
         if row["days"]:
 
             for day in row["days"].split(","):
 
                 if day:
+
                     group["days"].add(day)
 
-        if row["start_time"] and row["end_time"]:
+        if (
+            row["start_time"]
+            and
+            row["end_time"]
+        ):
 
             group["time_windows"].add(
                 (
@@ -450,532 +568,728 @@ def build_patterns():
                 )
             )
 
-        if row["visit_date"] < group["first_seen"]:
-            group["first_seen"] = row["visit_date"]
+        group["first_seen"] = min(
+            group["first_seen"],
+            row["visit_date"]
+        )
 
-        if row["visit_date"] > group["last_seen"]:
-            group["last_seen"] = row["visit_date"]
+        group["last_seen"] = max(
+            group["last_seen"],
+            row["visit_date"]
+        )
 
 
     patterns = []
 
     for group in groups.values():
 
-        count = len(group["reports"])
+        count = len(group["rows"])
 
-        status = pattern_status(
+        group["count"] = count
+
+        group["status"] = pattern_status(
             count,
             group["confirmed"]
         )
 
-        if group["delays"]:
+        group["confidence"] = confidence(
+            count
+        )
 
-            median_delay = median(
-                group["delays"]
-            )
-
-        else:
-
-            median_delay = 0
-
-        group["count"] = count
-        group["status"] = status
-        group["confidence"] = confidence_label(count)
-        group["median_delay"] = median_delay
+        group["median_delay"] = (
+            median(group["delays"])
+            if group["delays"]
+            else 0
+        )
 
         patterns.append(group)
 
     return patterns
 
 
-def applicable_visits_for_pattern(pattern):
+# ============================================================
+# MATCH PATTERNS TO JOB
+# ============================================================
 
-    visits = get_visits()
+def pattern_matches_job(
+    pattern,
+    address,
+    street,
+    suburb
+):
 
-    count = 0
+    if pattern["level"] == "Building":
 
-    for visit in visits:
+        return (
+            clean(pattern["location"])
+            ==
+            clean(address)
+        )
 
-        if pattern["profile_level"] == "Building":
+    if pattern["level"] == "Street":
 
-            if (
-                visit["address"].strip().lower()
-                ==
-                pattern["location"].strip().lower()
-            ):
-                count += 1
+        return (
+            clean(pattern["location"])
+            ==
+            clean(street)
+        )
 
-        else:
+    if pattern["level"] == "Area":
 
-            street = (
-                visit["street"] or ""
-            ).strip().lower()
+        return (
+            clean(pattern["location"])
+            ==
+            clean(suburb)
+        )
 
-            if (
-                street
-                ==
-                pattern["location"].strip().lower()
-            ):
-                count += 1
-
-    return count
+    return False
 
 
-def pattern_percentage(pattern):
+# ============================================================
+# CHECK WHETHER CONDITION APPLIES
+# ============================================================
 
-    visits = applicable_visits_for_pattern(
-        pattern
+def condition_applies(
+    pattern,
+    planned_time,
+    schedule_date
+):
+
+    day_name = schedule_date.strftime(
+        "%A"
     )
 
-    if visits == 0:
-        return 0
+    if (
+        pattern["days"]
+        and
+        day_name not in pattern["days"]
+    ):
 
-    return round(
-        pattern["count"] / visits * 100
-    )
+        return False
 
+    if pattern["time_windows"]:
+
+        for start, end in pattern["time_windows"]:
+
+            if time_inside_window(
+                planned_time,
+                start,
+                end
+            ):
+
+                return True
+
+        return False
+
+    return True
+
+
+# ============================================================
+# JOB PREDICTION ENGINE
+# ============================================================
+
+def analyse_job(
+    address,
+    street,
+    suburb,
+    planned_time,
+    schedule_date
+):
+
+    patterns = build_patterns()
+
+    matches = []
+
+    predicted_delay = 0
+
+    for pattern in patterns:
+
+        if pattern["status"] not in [
+            "Recognised",
+            "Confirmed"
+        ]:
+            continue
+
+        if not pattern_matches_job(
+            pattern,
+            address,
+            street,
+            suburb
+        ):
+            continue
+
+        if not condition_applies(
+            pattern,
+            planned_time,
+            schedule_date
+        ):
+            continue
+
+        matches.append(pattern)
+
+        predicted_delay += (
+            pattern["median_delay"]
+        )
+
+
+    if predicted_delay >= 20:
+
+        risk = "High"
+        icon = "🔴"
+
+    elif predicted_delay >= 10:
+
+        risk = "Moderate"
+        icon = "🟡"
+
+    elif matches:
+
+        risk = "Low"
+        icon = "🟢"
+
+    else:
+
+        risk = "No known difficulty"
+        icon = "⚪"
+
+
+    return {
+
+        "patterns": matches,
+
+        "predicted_delay":
+            predicted_delay,
+
+        "risk": risk,
+
+        "icon": icon
+    }
+
+
+# ============================================================
+# RECOMMENDATION ENGINE
+# ============================================================
 
 def recommendation(pattern):
-
-    condition = pattern["condition_type"]
 
     windows = list(
         pattern["time_windows"]
     )
 
-    if condition == "Clearway / timed parking restriction":
+    condition = pattern[
+        "condition_type"
+    ]
 
-        if windows:
+    if windows:
 
-            start, end = windows[0]
+        start, end = windows[0]
+
+        if condition == (
+            "Clearway / timed parking restriction"
+        ):
 
             return (
-                f"Avoid arrival between "
-                f"{format_time(start)} and "
+                f"Avoid {format_time(start)} – "
                 f"{format_time(end)}. "
-                f"Prefer scheduling after "
-                f"{format_time(end)} where practical."
+                f"Prefer arrival after "
+                f"{format_time(end)}."
             )
 
-        return (
-            "Check clearway times before scheduling."
-        )
-
-    if condition == "Peak-hour traffic":
-
-        if windows:
-
-            start, end = windows[0]
+        if condition == "School-zone traffic":
 
             return (
-                f"Avoid scheduling travel through this area "
-                f"between {format_time(start)} and "
-                f"{format_time(end)} where practical."
-            )
-
-    if condition == "School-zone traffic":
-
-        if windows:
-
-            start, end = windows[0]
-
-            return (
-                f"School-zone congestion recorded between "
-                f"{format_time(start)} and "
+                f"School-zone congestion recorded "
+                f"{format_time(start)} – "
                 f"{format_time(end)}. "
-                f"Prefer scheduling outside this window."
+                f"Schedule outside this window "
+                f"where practical."
             )
 
-    if pattern["median_delay"] > 0:
+        if condition == "Peak-hour traffic":
+
+            return (
+                f"Peak-hour delay recorded "
+                f"{format_time(start)} – "
+                f"{format_time(end)}."
+            )
+
+
+    if pattern["median_delay"]:
 
         return (
             f"Allow approximately "
-            f"+{round(pattern['median_delay'])} minutes "
-            f"additional operational time."
+            f"+{round(pattern['median_delay'])} "
+            f"minutes."
         )
 
     return None
 
 
 # ============================================================
-# DASHBOARD INTELLIGENCE
+# TREND ENGINE
 # ============================================================
 
-def dashboard_stats():
+def calculate_trend(pattern):
 
-    patterns = build_patterns()
-    visits = get_visits()
-
-    start = week_start().isoformat()
-
-    new_delays = [
-        p for p in patterns
-        if p["first_seen"] >= start
-    ]
-
-    new_patterns = [
-        p for p in patterns
-        if p["first_seen"] >= start
-        and p["status"] in [
-            "Recognised",
-            "Confirmed"
-        ]
-    ]
-
-    scheduling_patterns = [
-        p for p in patterns
-        if p["category"] == "Scheduling"
-        and p["first_seen"] >= start
-    ]
-
-    confirmed = [
-        p for p in patterns
-        if p["status"] == "Confirmed"
-    ]
-
-    solutions = [
-        p for p in patterns
-        if p["solutions"]
-        and p["first_seen"] >= start
-    ]
+    rows = sorted(
+        pattern["rows"],
+        key=lambda r: r["visit_date"]
+    )
 
     delays = [
-        p["median_delay"]
-        for p in patterns
-        if p["median_delay"] > 0
-        and p["status"] in [
-            "Recognised",
-            "Confirmed"
-        ]
+        r["delay_minutes"]
+        for r in rows
+        if r["delay_minutes"] > 0
     ]
 
-    overall_delay = (
-        median(delays)
-        if delays
-        else 0
+    if len(delays) < 4:
+
+        return None
+
+    midpoint = len(delays) // 2
+
+    older = delays[:midpoint]
+
+    recent = delays[midpoint:]
+
+    old_median = median(older)
+
+    new_median = median(recent)
+
+    difference = (
+        new_median - old_median
     )
 
-    total_minutes = sum(
-        visit["total_delay"]
-        for visit in visits
+
+    if difference >= 5:
+
+        return {
+            "direction": "Worsening",
+            "icon": "📈",
+            "old": old_median,
+            "new": new_median
+        }
+
+
+    if difference <= -5:
+
+        return {
+            "direction": "Improving",
+            "icon": "📉",
+            "old": old_median,
+            "new": new_median
+        }
+
+    return None
+
+
+# ============================================================
+# SOLUTION EFFECTIVENESS
+# ============================================================
+
+def solution_effectiveness(pattern):
+
+    rows = sorted(
+        pattern["rows"],
+        key=lambda r: r["visit_date"]
     )
+
+    solution_index = None
+
+    solution_name = None
+
+
+    for index, row in enumerate(rows):
+
+        if (
+            row["solution"]
+            and
+            row["solution"] != "None"
+        ):
+
+            solution_index = index
+            solution_name = row["solution"]
+            break
+
+
+    if solution_index is None:
+        return None
+
+
+    before = [
+        r["delay_minutes"]
+        for r in rows[:solution_index]
+        if r["delay_minutes"] > 0
+    ]
+
+
+    after = [
+        r["delay_minutes"]
+        for r in rows[solution_index:]
+        if r["delay_minutes"] >= 0
+    ]
+
+
+    if not before or len(after) < 2:
+
+        return None
+
+
+    before_median = median(before)
+
+    after_median = median(after)
+
+    saving = (
+        before_median - after_median
+    )
+
+
+    if saving <= 0:
+
+        return None
+
 
     return {
-        "new_delays": len(new_delays),
-        "new_patterns": len(new_patterns),
-        "scheduling_patterns": len(scheduling_patterns),
-        "confirmed": len(confirmed),
-        "solutions": len(solutions),
-        "expected_delay": overall_delay,
-        "total_minutes": total_minutes
+
+        "solution": solution_name,
+
+        "before": before_median,
+
+        "after": after_median,
+
+        "saving": saving,
+
+        "visits_after": len(after),
+
+        "total_saved":
+            saving * len(after)
     }
-
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "condition_builder" not in st.session_state:
-    st.session_state.condition_builder = []
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title("🏢 Building Difficulty Profile")
-
-st.caption(
-    "Field intelligence for access, parking, delays "
-    "and smarter scheduling."
-)
-
-
-# ============================================================
-# NAVIGATION
-# ============================================================
-
-page = st.radio(
-    "Navigation",
-    [
-        "📊 Dashboard",
-        "➕ Report",
-        "🏢 Profiles",
-        "📋 Reports"
-    ],
-    horizontal=True,
-    label_visibility="collapsed"
-)
-
-st.divider()
 
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
-if page == "📊 Dashboard":
+def show_dashboard():
 
-    st.header("📊 Operations Dashboard")
-
-    stats = dashboard_stats()
-
-    # --------------------------------------------------------
-    # HEADLINE INTELLIGENCE
-    # --------------------------------------------------------
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-
-        st.metric(
-            "🆕 New Delays This Week",
-            stats["new_delays"]
-        )
-
-    with col2:
-
-        st.metric(
-            "🔁 New Recurring Patterns",
-            stats["new_patterns"]
-        )
-
-    with col3:
-
-        st.metric(
-            "🕐 New Scheduling Patterns",
-            stats["scheduling_patterns"]
-        )
-
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-
-        st.metric(
-            "🔴 Confirmed Conditions",
-            stats["confirmed"]
-        )
-
-    with col2:
-
-        st.metric(
-            "⏱ Typical Expected Delay",
-            f"{round(stats['expected_delay'])} min"
-        )
-
-    with col3:
-
-        hours = (
-            stats["total_minutes"] / 60
-        )
-
-        st.metric(
-            "⌛ Total Field Time Lost",
-            f"{hours:.1f} hrs"
-        )
-
-
-    # --------------------------------------------------------
-    # WHAT CHANGED THIS WEEK
-    # --------------------------------------------------------
-
-    st.subheader("What Changed This Week")
+    st.header(
+        "📊 Operational Intelligence"
+    )
 
     patterns = build_patterns()
 
+    visits = get_visits()
+
     start = week_start().isoformat()
 
-    weekly = [
+
+    new_delays = [
         p for p in patterns
         if p["first_seen"] >= start
     ]
 
-    weekly.sort(
-        key=lambda x: (
-            x["status"] == "Confirmed",
-            x["status"] == "Recognised",
-            x["median_delay"]
-        ),
-        reverse=True
+
+    recurring = [
+        p for p in patterns
+        if (
+            p["first_seen"] >= start
+            and
+            p["status"] in [
+                "Recognised",
+                "Confirmed"
+            ]
+        )
+    ]
+
+
+    scheduling = [
+        p for p in recurring
+        if p["category"] == "Scheduling"
+    ]
+
+
+    confirmed = [
+        p for p in patterns
+        if p["status"] == "Confirmed"
+    ]
+
+
+    total_minutes = sum(
+        v["total_delay"]
+        for v in visits
     )
 
-    if not weekly:
+
+    # HEADLINE
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "🆕 New Delays This Week",
+        len(new_delays)
+    )
+
+    col2.metric(
+        "🔁 New Recurring Patterns",
+        len(recurring)
+    )
+
+    col3.metric(
+        "🕐 Scheduling Patterns",
+        len(scheduling)
+    )
+
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "🔴 Confirmed Conditions",
+        len(confirmed)
+    )
+
+    col2.metric(
+        "⌛ Recorded Time Lost",
+        f"{total_minutes / 60:.1f} hrs"
+    )
+
+
+    recognised_delays = [
+        p["median_delay"]
+        for p in patterns
+        if (
+            p["status"] in [
+                "Recognised",
+                "Confirmed"
+            ]
+            and
+            p["median_delay"] > 0
+        )
+    ]
+
+
+    typical = (
+        median(recognised_delays)
+        if recognised_delays
+        else 0
+    )
+
+
+    col3.metric(
+        "⏱ Typical Delay",
+        f"{round(typical)} min"
+    )
+
+
+    # -------------------------------------------
+    # NEW INTELLIGENCE
+    # -------------------------------------------
+
+    st.subheader(
+        "🧠 New Intelligence"
+    )
+
+    if not new_delays:
 
         st.info(
-            "No new operational intelligence "
-            "has been discovered this week."
+            "No new conditions discovered "
+            "this week."
         )
 
     else:
 
-        for pattern in weekly[:10]:
-
-            status = pattern["status"]
-
-            icon = pattern_icon(status)
-
-            if (
-                pattern["category"]
-                == "Scheduling"
-            ):
-                event_icon = "🕐"
-
-            elif pattern["solutions"]:
-                event_icon = "💡"
-
-            else:
-                event_icon = icon
-
-            st.markdown(
-                f"### {event_icon} "
-                f"{pattern['condition_type']}"
-            )
+        for pattern in new_delays[:8]:
 
             st.write(
                 f"**{pattern['location']}**"
             )
 
-            st.caption(
-                f"{pattern['count']} report(s) • "
-                f"{status} • "
-                f"{pattern['confidence']} confidence"
+            st.write(
+                f"{pattern['condition_type']} — "
+                f"{pattern['status']}"
             )
 
             if pattern["median_delay"]:
 
-                st.write(
-                    f"Typical delay: "
-                    f"**+{round(pattern['median_delay'])} min**"
+                st.caption(
+                    f"Typical delay "
+                    f"+{round(pattern['median_delay'])} min"
                 )
 
-            rec = recommendation(pattern)
-
-            if rec:
-                st.info(rec)
+            st.divider()
 
 
-    # --------------------------------------------------------
-    # HIGHEST IMPACT
-    # --------------------------------------------------------
+    # -------------------------------------------
+    # TRENDS
+    # -------------------------------------------
 
-    st.subheader("🔥 Highest Impact Locations")
+    st.subheader(
+        "📈 Changing Conditions"
+    )
 
-    recognised = [
-        p for p in patterns
-        if p["status"] in [
-            "Recognised",
-            "Confirmed"
-        ]
-    ]
+    trends_found = False
 
-    recognised.sort(
-        key=lambda x: x["median_delay"],
+    for pattern in patterns:
+
+        trend = calculate_trend(
+            pattern
+        )
+
+        if trend:
+
+            trends_found = True
+
+            st.write(
+                f"{trend['icon']} "
+                f"**{pattern['location']} — "
+                f"{pattern['condition_type']}**"
+            )
+
+            st.write(
+                f"{trend['direction']}: "
+                f"{round(trend['old'])} → "
+                f"{round(trend['new'])} min"
+            )
+
+
+    if not trends_found:
+
+        st.caption(
+            "More reports are needed before "
+            "trend detection becomes meaningful."
+        )
+
+
+    # -------------------------------------------
+    # SOLUTION EFFECTIVENESS
+    # -------------------------------------------
+
+    st.subheader(
+        "💡 Solutions Saving Time"
+    )
+
+    solutions_found = False
+
+    for pattern in patterns:
+
+        result = solution_effectiveness(
+            pattern
+        )
+
+        if result:
+
+            solutions_found = True
+
+            st.success(
+                f"**{pattern['location']}**\n\n"
+                f"{result['solution']}\n\n"
+                f"Median delay "
+                f"{round(result['before'])} → "
+                f"{round(result['after'])} min\n\n"
+                f"Estimated saving: "
+                f"**{round(result['saving'])} min/visit**"
+            )
+
+
+    if not solutions_found:
+
+        st.caption(
+            "Solution effectiveness will appear "
+            "once enough before/after visits exist."
+        )
+
+
+    # -------------------------------------------
+    # TOP OPPORTUNITIES
+    # -------------------------------------------
+
+    st.subheader(
+        "🎯 Highest Impact Opportunities"
+    )
+
+    opportunities = sorted(
+        patterns,
+        key=lambda p:
+            p["median_delay"] * p["count"],
         reverse=True
     )
 
-    if not recognised:
 
-        st.caption(
-            "Recognised patterns will appear here "
-            "as more field reports are collected."
+    for pattern in opportunities[:5]:
+
+        impact = (
+            pattern["median_delay"]
+            *
+            pattern["count"]
         )
 
-    else:
+        st.write(
+            f"**{severity_icon(pattern['median_delay'])} "
+            f"{pattern['location']}**"
+        )
 
-        for pattern in recognised[:5]:
+        st.write(
+            pattern["condition_type"]
+        )
 
-            st.write(
-                f"**{severity_icon(pattern['median_delay'])} "
-                f"{pattern['location']}**"
-            )
-
-            st.write(
-                f"{pattern['condition_type']} — "
-                f"+{round(pattern['median_delay'])} min"
-            )
-
-            st.caption(
-                f"{pattern['status']} • "
-                f"{pattern['count']} reports"
-            )
+        st.caption(
+            f"{pattern['count']} reports • "
+            f"{round(pattern['median_delay'])} min typical • "
+            f"~{round(impact)} recorded impact minutes"
+        )
 
 
 # ============================================================
-# REPORT PAGE
+# REPORT DIFFICULTY PAGE
 # ============================================================
 
-elif page == "➕ Report":
+def show_report_page():
 
-    st.header("➕ Report Field Difficulty")
-
-    st.caption(
-        "Record what was observed and how much "
-        "time it actually cost."
+    st.header(
+        "➕ Report Difficulty"
     )
-
-
-    # --------------------------------------------------------
-    # LOCATION
-    # --------------------------------------------------------
 
     visit_date = st.date_input(
         "Visit date",
-        value=date.today()
+        date.today()
     )
 
     address = st.text_input(
-        "Building / Job Address",
-        placeholder="100 George Street"
+        "Building / job address"
     )
 
     street = st.text_input(
-        "Street",
-        placeholder="George Street"
+        "Street"
     )
 
     suburb = st.text_input(
-        "Suburb",
-        placeholder="Sydney"
+        "Suburb / area"
     )
 
+
     profile_level = st.radio(
-        "This report primarily applies to",
+        "Condition applies to",
         [
             "Building",
-            "Street"
+            "Street",
+            "Area"
         ],
         horizontal=True
     )
 
 
-    # --------------------------------------------------------
-    # POSITIVE REPORT
-    # --------------------------------------------------------
-
     no_difficulty = st.checkbox(
-        "✅ No difficulty encountered on this visit"
+        "✅ No difficulty encountered"
     )
 
-    st.caption(
-        "Positive reports help determine how often "
-        "a difficulty actually occurs."
-    )
-
-
-    # --------------------------------------------------------
-    # CONDITION BUILDER
-    # --------------------------------------------------------
 
     if not no_difficulty:
 
-        st.divider()
-
         st.subheader(
-            "Add Difficulty"
+            "Add Condition"
         )
 
-        category = st.radio(
+
+        category_choice = st.radio(
             "Category",
             [
                 "Site / Access",
@@ -984,47 +1298,36 @@ elif page == "➕ Report":
             horizontal=True
         )
 
-        if category == "Site / Access":
+
+        if category_choice == "Scheduling":
 
             condition_type = st.selectbox(
-                "Difficulty",
-                SITE_CONDITIONS
+                "Scheduling condition",
+                SCHEDULING_CONDITIONS
             )
 
-            internal_category = "Site"
+            category = "Scheduling"
 
         else:
 
             condition_type = st.selectbox(
-                "Scheduling difficulty",
-                SCHEDULING_CONDITIONS
+                "Site condition",
+                SITE_CONDITIONS
             )
 
-            internal_category = "Scheduling"
+            category = "Site"
 
 
-        delay_minutes = st.number_input(
-            "Actual time lost from this condition",
-            min_value=0,
-            max_value=240,
-            value=0,
-            step=1
+        delay = st.number_input(
+            "Actual time lost (minutes)",
+            0,
+            240,
+            0
         )
 
-        if delay_minutes > 0:
-
-            st.caption(
-                f"{severity_icon(delay_minutes)} "
-                f"{severity(delay_minutes)} delay"
-            )
-
-
-        # ----------------------------------------------------
-        # APPLICABILITY
-        # ----------------------------------------------------
 
         applicability = st.selectbox(
-            "When does this condition apply?",
+            "Applicability",
             [
                 "Always",
                 "Certain times",
@@ -1032,85 +1335,53 @@ elif page == "➕ Report":
             ]
         )
 
+
         selected_days = []
-        start_time_value = None
-        end_time_value = None
+
+        start_value = None
+        end_value = None
 
 
-        if applicability == "Certain times":
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                start_value = st.time_input(
-                    "Starts",
-                    value=time(8, 0)
-                )
-
-            with col2:
-
-                end_value = st.time_input(
-                    "Ends",
-                    value=time(13, 0)
-                )
-
-            start_time_value = (
-                start_value.strftime("%H:%M")
-            )
-
-            end_time_value = (
-                end_value.strftime("%H:%M")
-            )
-
-
-        elif applicability == "Certain days and times":
+        if applicability == (
+            "Certain days and times"
+        ):
 
             selected_days = st.multiselect(
-                "Applicable days",
+                "Days",
                 DAYS,
-                default=[
-                    "Monday",
-                    "Tuesday",
-                    "Wednesday",
-                    "Thursday",
-                    "Friday"
-                ]
+                default=DAYS[:5]
             )
+
+
+        if applicability != "Always":
 
             col1, col2 = st.columns(2)
 
             with col1:
 
-                start_value = st.time_input(
-                    "Starts",
-                    value=time(8, 0),
-                    key="days_start"
+                s = st.time_input(
+                    "Start",
+                    time(8, 0)
                 )
 
             with col2:
 
-                end_value = st.time_input(
-                    "Ends",
-                    value=time(13, 0),
-                    key="days_end"
+                e = st.time_input(
+                    "End",
+                    time(13, 0)
                 )
 
-            start_time_value = (
-                start_value.strftime("%H:%M")
+            start_value = s.strftime(
+                "%H:%M"
             )
 
-            end_time_value = (
-                end_value.strftime("%H:%M")
+            end_value = e.strftime(
+                "%H:%M"
             )
 
-
-        # ----------------------------------------------------
-        # EVIDENCE
-        # ----------------------------------------------------
 
         source_status = st.radio(
-            "Evidence type",
+            "Evidence",
             [
                 "Field observation",
                 "Verified condition"
@@ -1118,38 +1389,24 @@ elif page == "➕ Report":
             horizontal=True
         )
 
+
         confirmed = st.checkbox(
-            "Confirm as recurring/permanent immediately"
+            "Confirm immediately as recurring/permanent"
         )
 
-        if confirmed:
-
-            st.caption(
-                "Use for objectively repeatable conditions "
-                "such as a signed clearway or permanent "
-                "building access requirement."
-            )
-
-
-        # ----------------------------------------------------
-        # SOLUTION
-        # ----------------------------------------------------
 
         solution = st.selectbox(
             "Known solution",
             SOLUTIONS
         )
 
+
         solution_notes = ""
 
         if solution != "None":
 
             solution_notes = st.text_input(
-                "Solution details",
-                placeholder=(
-                    "Example: Concierge can reserve "
-                    "contractor bay before arrival."
-                )
+                "Solution details"
             )
 
 
@@ -1158,155 +1415,125 @@ elif page == "➕ Report":
             "Contact concierge before arrival"
         ]
 
-        if concierge:
-
-            st.success(
-                "🛎️ Concierge solution will appear "
-                "on the profile."
-            )
-
-
-        # ----------------------------------------------------
-        # ADD CONDITION
-        # ----------------------------------------------------
 
         if st.button(
-            "➕ Add Difficulty to Report",
+            "➕ Add Condition",
             use_container_width=True
         ):
 
-            condition = {
-                "category": internal_category,
-                "condition_type": condition_type,
-                "delay_minutes": delay_minutes,
-                "applicability": applicability,
-                "days": selected_days,
-                "start_time": start_time_value,
-                "end_time": end_time_value,
-                "source_status": source_status,
-                "confirmed": confirmed,
-                "solution": solution,
-                "solution_notes": solution_notes,
-                "concierge": concierge
-            }
+            st.session_state.conditions.append({
 
-            st.session_state.condition_builder.append(
-                condition
-            )
+                "category": category,
+
+                "condition_type":
+                    condition_type,
+
+                "delay_minutes":
+                    delay,
+
+                "applicability":
+                    applicability,
+
+                "days":
+                    selected_days,
+
+                "start_time":
+                    start_value,
+
+                "end_time":
+                    end_value,
+
+                "source_status":
+                    source_status,
+
+                "confirmed":
+                    confirmed,
+
+                "solution":
+                    solution,
+
+                "solution_notes":
+                    solution_notes,
+
+                "concierge":
+                    concierge
+            })
 
             st.rerun()
 
 
-    # --------------------------------------------------------
-    # CURRENT REPORT
-    # --------------------------------------------------------
+    # -------------------------------------------
+    # CURRENT CONDITIONS
+    # -------------------------------------------
 
-    if st.session_state.condition_builder:
-
-        st.divider()
+    if st.session_state.conditions:
 
         st.subheader(
             "Current Report"
         )
 
         total = sum(
-            item["delay_minutes"]
-            for item
-            in st.session_state.condition_builder
+            c["delay_minutes"]
+            for c in st.session_state.conditions
         )
 
         st.metric(
-            "Total Time Lost",
+            "Total delay",
             f"{total} min"
         )
 
-        for index, item in enumerate(
-            st.session_state.condition_builder
+
+        for index, c in enumerate(
+            st.session_state.conditions
         ):
 
             with st.expander(
-                f"{index + 1}. "
-                f"{item['condition_type']} — "
-                f"{item['delay_minutes']} min"
+                f"{c['condition_type']} — "
+                f"{c['delay_minutes']} min"
             ):
 
                 st.write(
-                    f"**Category:** "
-                    f"{item['category']}"
+                    c["category"]
                 )
 
                 st.write(
-                    f"**Applicability:** "
-                    f"{item['applicability']}"
+                    c["applicability"]
                 )
 
-                if item["days"]:
+                if c["start_time"]:
 
                     st.write(
-                        "**Days:** "
-                        + ", ".join(item["days"])
-                    )
-
-                if (
-                    item["start_time"]
-                    and item["end_time"]
-                ):
-
-                    st.write(
-                        f"**Time:** "
-                        f"{format_time(item['start_time'])}"
+                        f"{format_time(c['start_time'])}"
                         f" – "
-                        f"{format_time(item['end_time'])}"
+                        f"{format_time(c['end_time'])}"
                     )
 
-                st.write(
-                    f"**Evidence:** "
-                    f"{item['source_status']}"
-                )
-
-                if item["confirmed"]:
+                if c["solution"] != "None":
 
                     st.write(
-                        "🔴 Immediately confirmed"
+                        f"💡 {c['solution']}"
                     )
 
-                if item["solution"] != "None":
-
-                    st.write(
-                        f"💡 {item['solution']}"
-                    )
 
                 if st.button(
                     "Remove",
-                    key=f"remove_condition_{index}"
+                    key=f"remove_{index}"
                 ):
 
-                    st.session_state.condition_builder.pop(
+                    st.session_state.conditions.pop(
                         index
                     )
 
                     st.rerun()
 
 
-    # --------------------------------------------------------
-    # NOTES
-    # --------------------------------------------------------
-
     notes = st.text_area(
-        "Visit notes",
-        placeholder=(
-            "Anything else that may help the "
-            "next technician or scheduler."
-        )
+        "Visit notes"
     )
 
 
-    # --------------------------------------------------------
-    # SAVE REPORT
-    # --------------------------------------------------------
-
     if st.button(
-        "💾 Save Field Report",
+        "💾 Save Report",
         type="primary",
         use_container_width=True
     ):
@@ -1314,18 +1541,18 @@ elif page == "➕ Report":
         if not address.strip():
 
             st.error(
-                "Enter the job/building address."
+                "Enter the job address."
             )
 
         elif (
             not no_difficulty
             and
-            not st.session_state.condition_builder
+            not st.session_state.conditions
         ):
 
             st.error(
-                "Add at least one difficulty or select "
-                "'No difficulty encountered'."
+                "Add a condition or select "
+                "No difficulty encountered."
             )
 
         else:
@@ -1337,368 +1564,596 @@ elif page == "➕ Report":
                 suburb,
                 profile_level,
                 no_difficulty,
-                st.session_state.condition_builder,
+                st.session_state.conditions,
                 notes
             )
 
-            st.session_state.condition_builder = []
+            st.session_state.conditions = []
 
             st.success(
-                "Field report saved successfully."
+                "Report saved."
             )
+
+
+# ============================================================
+# PREDICT JOB PAGE
+# ============================================================
+
+def show_predictor():
+
+    st.header(
+        "🧠 Job Difficulty Predictor"
+    )
+
+    st.caption(
+        "Test a proposed job time against "
+        "known operational intelligence."
+    )
+
+
+    address = st.text_input(
+        "Address",
+        key="predict_address"
+    )
+
+    street = st.text_input(
+        "Street",
+        key="predict_street"
+    )
+
+    suburb = st.text_input(
+        "Suburb / area",
+        key="predict_suburb"
+    )
+
+
+    planned_date = st.date_input(
+        "Proposed date",
+        date.today()
+    )
+
+
+    planned = st.time_input(
+        "Proposed arrival",
+        time(9, 0)
+    )
+
+
+    if st.button(
+        "Analyse Job",
+        type="primary",
+        use_container_width=True
+    ):
+
+        result = analyse_job(
+            address,
+            street,
+            suburb,
+            planned.strftime("%H:%M"),
+            planned_date
+        )
+
+
+        st.header(
+            f"{result['icon']} "
+            f"{result['risk']} Difficulty"
+        )
+
+
+        st.metric(
+            "Predicted Additional Time",
+            f"+{round(result['predicted_delay'])} min"
+        )
+
+
+        if not result["patterns"]:
+
+            st.success(
+                "No recognised difficulty patterns "
+                "currently apply to this job."
+            )
+
+
+        for pattern in result["patterns"]:
+
+            st.subheader(
+                pattern["condition_type"]
+            )
+
+            st.write(
+                f"**Source:** "
+                f"{pattern['level']} profile"
+            )
+
+            st.write(
+                f"**Evidence:** "
+                f"{pattern['count']} reports • "
+                f"{pattern['confidence']} confidence"
+            )
+
+
+            rec = recommendation(
+                pattern
+            )
+
+            if rec:
+
+                st.info(
+                    f"💡 {rec}"
+                )
+
+
+            for solution in pattern["solutions"]:
+
+                if "Concierge" in solution:
+
+                    st.success(
+                        f"🛎️ {solution}"
+                    )
+
+                else:
+
+                    st.success(
+                        f"💡 {solution}"
+                    )
+
+
+# ============================================================
+# SCREENSHOT SCHEDULE IMPORT
+# ============================================================
+
+def show_schedule_import():
+
+    st.header(
+        "📸 Import Daily Schedule"
+    )
+
+    st.write(
+        "Upload screenshots of your Field schedule."
+    )
+
+    st.info(
+        "V3 prototype: screenshots are staged here "
+        "for schedule extraction. Automatic image-to-job "
+        "extraction is the next connector step."
+    )
+
+
+    schedule_date = st.date_input(
+        "Schedule date",
+        date.today(),
+        key="schedule_date"
+    )
+
+
+    screenshots = st.file_uploader(
+        "Upload Field screenshots",
+        type=[
+            "png",
+            "jpg",
+            "jpeg"
+        ],
+        accept_multiple_files=True
+    )
+
+
+    if screenshots:
+
+        st.success(
+            f"{len(screenshots)} screenshot(s) uploaded."
+        )
+
+        for index, image in enumerate(
+            screenshots
+        ):
+
+            with st.expander(
+                f"Screenshot {index + 1}"
+            ):
+
+                st.image(
+                    image,
+                    use_container_width=True
+                )
+
+
+        st.divider()
+
+        st.subheader(
+            "Extraction Pipeline"
+        )
+
+        st.write(
+            "The extraction engine will identify:"
+        )
+
+        st.write(
+            "• Planned arrival time"
+        )
+
+        st.write(
+            "• Address"
+        )
+
+        st.write(
+            "• Street"
+        )
+
+        st.write(
+            "• Suburb"
+        )
+
+        st.write(
+            "• Job ID"
+        )
+
+        st.write(
+            "• Job vs agency pickup/drop-off"
+        )
+
+
+        st.warning(
+            "Automatic screenshot reading is not "
+            "connected in this prototype build yet. "
+            "The rest of the scheduling intelligence "
+            "engine is ready for extracted jobs."
+        )
 
 
 # ============================================================
 # PROFILES
 # ============================================================
 
-elif page == "🏢 Profiles":
+def show_profiles():
 
     st.header(
-        "🏢 Difficulty Profiles"
+        "🏢 Intelligence Profiles"
     )
 
     patterns = build_patterns()
 
+
     if not patterns:
 
         st.info(
-            "No difficulty intelligence has "
-            "been collected yet."
+            "No intelligence profiles yet."
         )
 
-    else:
-
-        search = st.text_input(
-            "🔎 Search address, street or suburb",
-            placeholder="Start typing..."
-        )
-
-        filtered = patterns
-
-        if search:
-
-            term = search.lower()
-
-            filtered = [
-                p for p in patterns
-                if (
-                    term in p["location"].lower()
-                    or
-                    term in (
-                        p["suburb"] or ""
-                    ).lower()
-                )
-            ]
+        return
 
 
-        locations = sorted(
-            set(
-                p["location"]
-                for p in filtered
+    search = st.text_input(
+        "🔎 Search address, street or suburb"
+    )
+
+
+    filtered = patterns
+
+
+    if search:
+
+        term = clean(search)
+
+        filtered = [
+
+            p for p in patterns
+
+            if (
+                term in clean(p["location"])
+                or
+                term in clean(p["suburb"])
             )
+        ]
+
+
+    locations = sorted(
+        set(
+            p["location"]
+            for p in filtered
+            if p["location"]
+        )
+    )
+
+
+    if not locations:
+
+        st.warning(
+            "No matching profiles."
+        )
+
+        return
+
+
+    selected = st.selectbox(
+        "Location",
+        locations
+    )
+
+
+    location_patterns = [
+
+        p for p in filtered
+
+        if p["location"] == selected
+    ]
+
+
+    concierge = any(
+        p["concierge"]
+        for p in location_patterns
+    )
+
+
+    title = f"⚠️ {selected}"
+
+    if concierge:
+
+        title += " 🛎️"
+
+
+    st.header(title)
+
+
+    for pattern in location_patterns:
+
+        st.subheader(
+            pattern["condition_type"]
         )
 
 
-        if not locations:
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "Reports",
+            pattern["count"]
+        )
+
+        col2.metric(
+            "Median Delay",
+            f"{round(pattern['median_delay'])} min"
+        )
+
+        col3.metric(
+            "Confidence",
+            pattern["confidence"]
+        )
+
+
+        st.write(
+            f"**Status:** "
+            f"{pattern['status']}"
+        )
+
+
+        if pattern["time_windows"]:
+
+            for start, end in (
+                pattern["time_windows"]
+            ):
+
+                st.write(
+                    f"🕐 "
+                    f"{format_time(start)} – "
+                    f"{format_time(end)}"
+                )
+
+
+        rec = recommendation(
+            pattern
+        )
+
+        if rec:
+
+            st.info(
+                rec
+            )
+
+
+        trend = calculate_trend(
+            pattern
+        )
+
+        if trend:
 
             st.warning(
-                "No matching profiles."
+                f"{trend['icon']} "
+                f"{trend['direction']}: "
+                f"{round(trend['old'])} → "
+                f"{round(trend['new'])} min"
             )
 
-        else:
 
-            selected = st.selectbox(
-                "Location",
-                locations
+        effectiveness = (
+            solution_effectiveness(
+                pattern
+            )
+        )
+
+
+        if effectiveness:
+
+            st.success(
+                f"💡 {effectiveness['solution']} "
+                f"is associated with approximately "
+                f"{round(effectiveness['saving'])} "
+                f"minutes saved per visit."
             )
 
-            location_patterns = [
-                p for p in filtered
-                if p["location"] == selected
-            ]
 
+        for solution in (
+            pattern["solutions"]
+        ):
 
-            # ------------------------------------------------
-            # PROFILE SUMMARY
-            # ------------------------------------------------
-
-            has_concierge = any(
-                p["concierge"]
-                for p in location_patterns
+            st.write(
+                f"💡 **Known solution:** "
+                f"{solution}"
             )
 
-            if has_concierge:
 
-                st.header(
-                    f"⚠️ {selected} 🛎️"
-                )
+        for note in (
+            pattern["solution_notes"]
+        ):
 
-            else:
-
-                st.header(
-                    f"⚠️ {selected}"
-                )
+            st.caption(note)
 
 
-            recognised = [
-                p for p in location_patterns
-                if p["status"] in [
-                    "Recognised",
-                    "Confirmed"
-                ]
-            ]
-
-            expected_delays = [
-                p["median_delay"]
-                for p in recognised
-                if p["median_delay"] > 0
-            ]
-
-            if expected_delays:
-
-                expected = median(
-                    expected_delays
-                )
-
-                st.warning(
-                    f"⏱ Expected additional time: "
-                    f"approximately "
-                    f"+{round(expected)} minutes"
-                )
-
-
-            # ------------------------------------------------
-            # ACTIONABLE WARNINGS
-            # ------------------------------------------------
-
-            st.subheader(
-                "Actionable Intelligence"
-            )
-
-            for pattern in location_patterns:
-
-                icon = pattern_icon(
-                    pattern["status"]
-                )
-
-                st.markdown(
-                    f"### {icon} "
-                    f"{pattern['condition_type']}"
-                )
-
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-
-                    st.metric(
-                        "Reports",
-                        pattern["count"]
-                    )
-
-                with col2:
-
-                    st.metric(
-                        "Encounter Rate",
-                        f"{pattern_percentage(pattern)}%"
-                    )
-
-                with col3:
-
-                    st.metric(
-                        "Median Delay",
-                        f"{round(pattern['median_delay'])} min"
-                    )
-
-
-                st.caption(
-                    f"{pattern['status']} pattern • "
-                    f"{pattern['confidence']} confidence"
-                )
-
-
-                if pattern["time_windows"]:
-
-                    for start, end in pattern["time_windows"]:
-
-                        st.write(
-                            f"🕐 **Applies:** "
-                            f"{format_time(start)} – "
-                            f"{format_time(end)}"
-                        )
-
-
-                if pattern["days"]:
-
-                    st.write(
-                        "📅 **Days:** "
-                        + ", ".join(
-                            sorted(pattern["days"])
-                        )
-                    )
-
-
-                rec = recommendation(
-                    pattern
-                )
-
-                if rec:
-
-                    st.info(
-                        f"💡 {rec}"
-                    )
-
-
-                if pattern["solutions"]:
-
-                    for solution in sorted(
-                        pattern["solutions"]
-                    ):
-
-                        if "Concierge" in solution:
-
-                            st.success(
-                                f"🛎️ {solution}"
-                            )
-
-                        else:
-
-                            st.success(
-                                f"💡 {solution}"
-                            )
-
-                st.divider()
+        st.divider()
 
 
 # ============================================================
 # REPORT HISTORY
 # ============================================================
 
-elif page == "📋 Reports":
+def show_history():
 
     st.header(
-        "📋 Field Report History"
+        "📋 Field Reports"
     )
 
     visits = get_visits()
 
+
     if not visits:
 
         st.info(
-            "No reports have been recorded."
+            "No reports yet."
         )
 
-    else:
+        return
 
-        for visit in visits:
 
-            title = (
-                f"{visit['visit_date']} — "
+    for visit in visits:
+
+        title = (
+            f"{visit['visit_date']} — "
+            f"{visit['address']}"
+        )
+
+
+        if visit["total_delay"]:
+
+            title += (
+                f" — "
+                f"{visit['total_delay']} min"
+            )
+
+
+        with st.expander(title):
+
+            st.write(
+                f"**Address:** "
                 f"{visit['address']}"
             )
 
-            if visit["total_delay"]:
 
-                title += (
-                    f" — {visit['total_delay']} min"
-                )
-
-            with st.expander(title):
+            if visit["street"]:
 
                 st.write(
-                    f"**Address:** "
-                    f"{visit['address']}"
+                    f"**Street:** "
+                    f"{visit['street']}"
                 )
 
-                if visit["street"]:
 
-                    st.write(
-                        f"**Street:** "
-                        f"{visit['street']}"
-                    )
-
-                if visit["suburb"]:
-
-                    st.write(
-                        f"**Suburb:** "
-                        f"{visit['suburb']}"
-                    )
+            if visit["suburb"]:
 
                 st.write(
-                    f"**Profile level:** "
-                    f"{visit['profile_level']}"
-                )
-
-                if visit["no_difficulty"]:
-
-                    st.success(
-                        "✅ No difficulty encountered"
-                    )
-
-                else:
-
-                    condition_rows = execute("""
-                        SELECT *
-                        FROM conditions
-                        WHERE visit_id = ?
-                        ORDER BY id
-                    """, (
-                        visit["id"],
-                    )).fetchall()
-
-                    for row in condition_rows:
-
-                        st.markdown(
-                            f"**{row['condition_type']}**"
-                        )
-
-                        st.write(
-                            f"Time lost: "
-                            f"{row['delay_minutes']} min"
-                        )
-
-                        if (
-                            row["start_time"]
-                            and row["end_time"]
-                        ):
-
-                            st.write(
-                                f"Applies: "
-                                f"{format_time(row['start_time'])}"
-                                f" – "
-                                f"{format_time(row['end_time'])}"
-                            )
-
-                        if row["solution"] != "None":
-
-                            st.write(
-                                f"💡 {row['solution']}"
-                            )
-
-                        st.write("---")
-
-
-                if visit["notes"]:
-
-                    st.write(
-                        f"**Notes:** "
-                        f"{visit['notes']}"
-                    )
-
-
-                st.metric(
-                    "Total Recorded Delay",
-                    f"{visit['total_delay']} min"
+                    f"**Area:** "
+                    f"{visit['suburb']}"
                 )
 
 
-                if st.button(
-                    "🗑 Delete Report",
-                    key=f"delete_visit_{visit['id']}"
-                ):
+            if visit["no_difficulty"]:
 
-                    delete_visit(
-                        visit["id"]
-                    )
+                st.success(
+                    "✅ No difficulty encountered"
+                )
 
-                    st.rerun()
+
+            rows = execute("""
+                SELECT *
+                FROM conditions
+                WHERE visit_id = ?
+                ORDER BY id
+            """, (
+                visit["id"],
+            )).fetchall()
+
+
+            for row in rows:
+
+                st.write(
+                    f"**{row['condition_type']}** "
+                    f"— {row['delay_minutes']} min"
+                )
+
+
+            if visit["notes"]:
+
+                st.write(
+                    visit["notes"]
+                )
+
+
+# ============================================================
+# APP HEADER
+# ============================================================
+
+st.title(
+    "🏢 Building Difficulty Intelligence"
+)
+
+st.caption(
+    "Field observations → recurring patterns → "
+    "predicted delays → better scheduling"
+)
+
+
+page = st.radio(
+    "Navigation",
+    [
+        "📊 Dashboard",
+        "➕ Report",
+        "🧠 Predict",
+        "📸 Schedule",
+        "🏢 Profiles",
+        "📋 History"
+    ],
+    horizontal=True,
+    label_visibility="collapsed"
+)
+
+st.divider()
+
+
+# ============================================================
+# ROUTING
+# ============================================================
+
+if page == "📊 Dashboard":
+
+    show_dashboard()
+
+
+elif page == "➕ Report":
+
+    show_report_page()
+
+
+elif page == "🧠 Predict":
+
+    show_predictor()
+
+
+elif page == "📸 Schedule":
+
+    show_schedule_import()
+
+
+elif page == "🏢 Profiles":
+
+    show_profiles()
+
+
+elif page == "📋 History":
+
+    show_history()
