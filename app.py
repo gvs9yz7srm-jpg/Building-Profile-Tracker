@@ -1,3 +1,5 @@
+V3.4
+
 import streamlit as st
 import sqlite3
 import re
@@ -23,15 +25,8 @@ from reportlab.lib import colors
 
 
 # ============================================================
-# BUILDING DIFFICULTY INTELLIGENCE — V3.5
-#
-# CORE RULE:
-#
-# FIELD REPORTS = EVIDENCE
-# EVIDENCE = INTELLIGENCE
-# INTELLIGENCE = PREDICTIONS
-#
-# Schedule predictions NEVER become field evidence.
+# BUILDING DIFFICULTY INTELLIGENCE — V3.4
+# FIELD VALIDATION BUILD
 # ============================================================
 
 st.set_page_config(
@@ -66,6 +61,34 @@ def execute(query, params=()):
     cursor.execute(query, params)
     conn.commit()
     return cursor
+
+
+def column_exists(table_name, column_name):
+    rows = execute(
+        f"PRAGMA table_info({table_name})"
+    ).fetchall()
+
+    return any(
+        row["name"] == column_name
+        for row in rows
+    )
+
+
+def add_column_if_missing(
+    table_name,
+    column_name,
+    column_definition
+):
+    if not column_exists(
+        table_name,
+        column_name
+    ):
+        execute(
+            f"""
+            ALTER TABLE {table_name}
+            ADD COLUMN {column_name} {column_definition}
+            """
+        )
 
 
 execute("""
@@ -142,13 +165,30 @@ CREATE TABLE IF NOT EXISTS prediction_reports (
     schedule_date TEXT NOT NULL,
     total_stops INTEGER DEFAULT 0,
     total_jobs INTEGER DEFAULT 0,
-    agency_pickups INTEGER DEFAULT 0,
-    agency_dropoffs INTEGER DEFAULT 0,
-    agency_stops INTEGER DEFAULT 0,
     flagged_stops INTEGER DEFAULT 0,
     predicted_delay INTEGER DEFAULT 0
 )
 """)
+
+
+# V3.4 database additions
+add_column_if_missing(
+    "prediction_reports",
+    "agency_pickups",
+    "INTEGER DEFAULT 0"
+)
+
+add_column_if_missing(
+    "prediction_reports",
+    "agency_dropoffs",
+    "INTEGER DEFAULT 0"
+)
+
+add_column_if_missing(
+    "prediction_reports",
+    "agency_stops",
+    "INTEGER DEFAULT 0"
+)
 
 
 execute("""
@@ -171,52 +211,19 @@ CREATE TABLE IF NOT EXISTS prediction_jobs (
 """)
 
 
+add_column_if_missing(
+    "prediction_jobs",
+    "cumulative_delay",
+    "INTEGER DEFAULT 0"
+)
+
+
 execute("""
 CREATE TABLE IF NOT EXISTS settings (
     setting_key TEXT PRIMARY KEY,
     setting_value TEXT
 )
 """)
-
-
-# ============================================================
-# SAFE DATABASE UPGRADES
-# ============================================================
-
-def ensure_column(table, column, definition):
-    columns = execute(
-        f"PRAGMA table_info({table})"
-    ).fetchall()
-
-    existing = [
-        row["name"]
-        for row in columns
-    ]
-
-    if column not in existing:
-        execute(
-            f"ALTER TABLE {table} "
-            f"ADD COLUMN {column} {definition}"
-        )
-
-
-ensure_column(
-    "prediction_reports",
-    "agency_pickups",
-    "INTEGER DEFAULT 0"
-)
-
-ensure_column(
-    "prediction_reports",
-    "agency_dropoffs",
-    "INTEGER DEFAULT 0"
-)
-
-ensure_column(
-    "prediction_reports",
-    "agency_stops",
-    "INTEGER DEFAULT 0"
-)
 
 
 # ============================================================
@@ -418,11 +425,18 @@ def normalise_time(value):
                 value,
                 fmt
             ).strftime("%H:%M")
-
         except:
             pass
 
     return ""
+
+
+def week_start():
+    today = date.today()
+
+    return today - timedelta(
+        days=today.weekday()
+    )
 
 
 def pattern_status(count, confirmed):
@@ -469,11 +483,7 @@ def time_inside_window(planned, start, end):
         ).time()
 
         if start_time <= end_time:
-            return (
-                start_time
-                <= planned_time
-                <= end_time
-            )
+            return start_time <= planned_time <= end_time
 
         return (
             planned_time >= start_time
@@ -485,7 +495,7 @@ def time_inside_window(planned, start, end):
 
 
 # ============================================================
-# ADDRESS CLEANING
+# ADDRESS CLEANER
 # ============================================================
 
 def clean_address_line(line):
@@ -518,15 +528,10 @@ def looks_like_address(line):
     if not line:
         return False
 
-    cleaned = clean_address_line(
-        line
-    )
+    cleaned = clean_address_line(line)
 
     return bool(
-        re.search(
-            r"\d",
-            cleaned
-        )
+        re.search(r"\d", cleaned)
         and
         re.search(
             rf"\b(?:{STREET_TYPES})\b",
@@ -605,7 +610,7 @@ def reset_schedule():
 
 
 # ============================================================
-# PROPERTY EVIDENCE
+# PROPERTY DATA
 # ============================================================
 
 def save_visit(
@@ -676,9 +681,7 @@ def save_visit(
             condition["condition_type"],
             condition["delay_minutes"],
             condition["applicability"],
-            ",".join(
-                condition["days"]
-            ),
+            ",".join(condition["days"]),
             condition["start_time"],
             condition["end_time"],
             condition["source_status"],
@@ -693,8 +696,7 @@ def get_visits():
     return execute("""
         SELECT *
         FROM visits
-        ORDER BY visit_date DESC,
-        created_at DESC
+        ORDER BY visit_date DESC, created_at DESC
     """).fetchall()
 
 
@@ -766,9 +768,7 @@ def build_patterns():
 
         group = groups[key]
 
-        group["rows"].append(
-            row
-        )
+        group["rows"].append(row)
 
         if row["delay_minutes"] > 0:
             group["delays"].append(
@@ -1128,7 +1128,9 @@ def get_agency_intelligence(
         for row in delays
     )
 
-    count = len(delays)
+    count = len(
+        delays
+    )
 
     recognised = (
         confirmed_recurring
@@ -1144,7 +1146,9 @@ def get_agency_intelligence(
     reasons = []
 
     for row in delays:
-        reason = row["delay_reason"]
+        reason = row[
+            "delay_reason"
+        ]
 
         if (
             reason
@@ -1187,8 +1191,8 @@ def analyse_agency_stop(job):
         icon = "🟡"
 
     else:
-        risk = "No recognised delay"
-        icon = "📦"
+        risk = "Operational stop"
+        icon = "🔑"
 
     return {
         "risk": risk,
@@ -1225,7 +1229,9 @@ def preprocess_image(uploaded_file):
 
     image = ImageEnhance.Contrast(
         image
-    ).enhance(1.6)
+    ).enhance(
+        1.6
+    )
 
     return image
 
@@ -1358,12 +1364,8 @@ def find_agency_name(lines):
             ]:
                 if (
                     candidate
-                    and not looks_like_address(
-                        candidate
-                    )
-                    and not looks_like_suburb(
-                        candidate
-                    )
+                    and not looks_like_address(candidate)
+                    and not looks_like_suburb(candidate)
                     and "anticipated"
                     not in candidate.lower()
                 ):
@@ -1379,9 +1381,7 @@ def extract_schedule_from_text(text):
             " ",
             line
         ).strip()
-
         for line in text.splitlines()
-
         if line.strip()
     ]
 
@@ -1403,7 +1403,6 @@ def extract_schedule_from_text(text):
             clean(stop["address"])
             ==
             clean(address)
-
             for stop in stops
         ):
             continue
@@ -1440,13 +1439,10 @@ def extract_schedule_from_text(text):
                         candidate
                     )
                 )
-
                 break
 
-        planned_time = (
-            find_anticipated_time(
-                block
-            )
+        planned_time = find_anticipated_time(
+            block
         )
 
         if stop_type == "Job":
@@ -1459,10 +1455,8 @@ def extract_schedule_from_text(text):
         else:
             job_id = ""
 
-            agency_name = (
-                find_agency_name(
-                    block
-                )
+            agency_name = find_agency_name(
+                block
             )
 
         stops.append({
@@ -1483,7 +1477,6 @@ def extract_schedule_from_text(text):
                     stop["planned_time"],
                     "%H:%M"
                 ).time()
-
             except:
                 pass
 
@@ -1506,7 +1499,70 @@ def extract_schedule_from_text(text):
 
 
 # ============================================================
-# PDF GENERATOR
+# V3.4 WORKLOAD SUMMARY
+# ============================================================
+
+def calculate_workload_summary(
+    analysed_jobs
+):
+    service_jobs = 0
+    agency_pickups = 0
+    agency_dropoffs = 0
+    flagged_stops = 0
+    predicted_delay = 0
+    cumulative_delay = 0
+
+    for item in analysed_jobs:
+        job = item["job"]
+        result = item["result"]
+
+        if job["stop_type"] == "Job":
+            service_jobs += 1
+
+        elif job["stop_type"] == "Agency Pickup":
+            agency_pickups += 1
+
+        elif job["stop_type"] == "Agency Drop-off":
+            agency_dropoffs += 1
+
+        delay = result[
+            "predicted_delay"
+        ]
+
+        if delay > 0:
+            flagged_stops += 1
+
+        predicted_delay += delay
+        cumulative_delay += delay
+
+        result["cumulative_delay"] = (
+            cumulative_delay
+        )
+
+    agency_stops = (
+        agency_pickups
+        + agency_dropoffs
+    )
+
+    total_operational_stops = (
+        service_jobs
+        + agency_stops
+    )
+
+    return {
+        "total_stops": total_operational_stops,
+        "total_jobs": service_jobs,
+        "service_jobs": service_jobs,
+        "agency_pickups": agency_pickups,
+        "agency_dropoffs": agency_dropoffs,
+        "agency_stops": agency_stops,
+        "flagged_stops": flagged_stops,
+        "predicted_delay": predicted_delay
+    }
+
+
+# ============================================================
+# PDF GENERATOR — V3.4
 # ============================================================
 
 def generate_predictive_pdf(
@@ -1523,7 +1579,10 @@ def generate_predictive_pdf(
         leftMargin=16 * mm,
         topMargin=16 * mm,
         bottomMargin=16 * mm,
-        title="Predictive Daily Operational Report"
+        title=(
+            "Predictive Daily "
+            "Operational Report"
+        )
     )
 
     styles = getSampleStyleSheet()
@@ -1595,10 +1654,12 @@ def generate_predictive_pdf(
         )
     )
 
+    generated_time = datetime.now()
+
     story.append(
         Paragraph(
-            "Generated before day progression: "
-            + datetime.now().strftime(
+            "Prediction generated: "
+            + generated_time.strftime(
                 "%d %B %Y at %I:%M %p"
             ),
             body_style
@@ -1608,52 +1669,67 @@ def generate_predictive_pdf(
     story.append(
         Spacer(
             1,
-            10
+            14
         )
     )
 
-    summary_data = [
+    # --------------------------------------------------------
+    # DAILY OPERATIONAL LOAD
+    # --------------------------------------------------------
+
+    story.append(
+        Paragraph(
+            "Daily Operational Load",
+            heading_style
+        )
+    )
+
+    workload_data = [
         [
-            "Service Jobs",
-            "Agency Stops",
-            "Flagged Stops",
-            "Predicted Delay"
+            "Operational Measure",
+            "Count"
         ],
         [
+            "Service jobs",
             str(
-                summary["total_jobs"]
-            ),
+                summary["service_jobs"]
+            )
+        ],
+        [
+            "Agency pickups",
+            str(
+                summary["agency_pickups"]
+            )
+        ],
+        [
+            "Agency drop-offs",
+            str(
+                summary["agency_dropoffs"]
+            )
+        ],
+        [
+            "Total agency stops",
             str(
                 summary["agency_stops"]
-            ),
-            str(
-                summary["flagged_stops"]
-            ),
-            (
-                "+"
-                + str(
-                    round(
-                        summary[
-                            "predicted_delay"
-                        ]
-                    )
-                )
-                + " min"
             )
-        ]
+        ],
+        [
+            "TOTAL OPERATIONAL STOPS",
+            str(
+                summary["total_stops"]
+            )
+        ],
     ]
 
-    summary_table = Table(
-        summary_data,
+    workload_table = Table(
+        workload_data,
         colWidths=[
-            42 * mm,
-            42 * mm,
-            42 * mm,
-            42 * mm
+            120 * mm,
+            45 * mm
         ]
     )
 
-    summary_table.setStyle(
+    workload_table.setStyle(
         TableStyle([
             (
                 "BACKGROUND",
@@ -1668,10 +1744,10 @@ def generate_predictive_pdf(
                 "Helvetica-Bold"
             ),
             (
-                "ALIGN",
-                (0, 0),
+                "FONTNAME",
+                (0, -1),
                 (-1, -1),
-                "CENTER"
+                "Helvetica-Bold"
             ),
             (
                 "GRID",
@@ -1681,52 +1757,126 @@ def generate_predictive_pdf(
                 colors.grey
             ),
             (
+                "ALIGN",
+                (1, 0),
+                (1, -1),
+                "CENTER"
+            ),
+            (
                 "TOPPADDING",
                 (0, 0),
                 (-1, -1),
-                7
+                6
             ),
             (
                 "BOTTOMPADDING",
                 (0, 0),
                 (-1, -1),
-                7
+                6
             )
         ])
     )
 
     story.append(
-        summary_table
+        workload_table
     )
 
     story.append(
         Spacer(
             1,
-            10
+            8
         )
     )
 
+    if summary["agency_stops"] > 0:
+        story.append(
+            Paragraph(
+                "<b>Operational workload note:</b> "
+                f"{summary['agency_stops']} agency "
+                "stop(s) are required operational "
+                "movements but do not count as "
+                "service completions.",
+                body_style
+            )
+        )
+
     story.append(
-        Paragraph(
-            (
-                f"Agency pickups: "
-                f"{summary['agency_pickups']} &nbsp;&nbsp; "
-                f"Agency drop-offs: "
-                f"{summary['agency_dropoffs']}"
-            ),
-            body_style
+        Spacer(
+            1,
+            16
         )
     )
 
+    # --------------------------------------------------------
+    # PREDICTION SUMMARY
+    # --------------------------------------------------------
+
     story.append(
         Paragraph(
-            (
-                "Agency stops are operational travel/"
-                "access stops and do not represent "
-                "service completions."
-            ),
-            small_style
+            "Prediction Summary",
+            heading_style
         )
+    )
+
+    prediction_data = [
+        [
+            "Stops with predicted delay",
+            str(
+                summary["flagged_stops"]
+            )
+        ],
+        [
+            "Predicted total delay",
+            f"+{round(summary['predicted_delay'])} min"
+        ]
+    ]
+
+    prediction_table = Table(
+        prediction_data,
+        colWidths=[
+            120 * mm,
+            45 * mm
+        ]
+    )
+
+    prediction_table.setStyle(
+        TableStyle([
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.grey
+            ),
+            (
+                "FONTNAME",
+                (0, 0),
+                (0, -1),
+                "Helvetica-Bold"
+            ),
+            (
+                "ALIGN",
+                (1, 0),
+                (1, -1),
+                "CENTER"
+            ),
+            (
+                "TOPPADDING",
+                (0, 0),
+                (-1, -1),
+                6
+            ),
+            (
+                "BOTTOMPADDING",
+                (0, 0),
+                (-1, -1),
+                6
+            )
+        ])
+    )
+
+    story.append(
+        prediction_table
     )
 
     story.append(
@@ -1736,41 +1886,42 @@ def generate_predictive_pdf(
         )
     )
 
+    # --------------------------------------------------------
+    # FULL SCHEDULE
+    # --------------------------------------------------------
+
     story.append(
         Paragraph(
-            "Predicted Difficulties",
+            "Scheduled Operational Stops",
             heading_style
         )
     )
 
-    flagged_items = [
-        item
-        for item in analysed_jobs
-        if item["result"][
-            "predicted_delay"
-        ] > 0
-    ]
-
-    if not flagged_items:
-        story.append(
-            Paragraph(
-                (
-                    "No recognised predictive delays "
-                    "were identified for this schedule "
-                    "at the time of analysis."
-                ),
-                body_style
-            )
-        )
-
-    for item in flagged_items:
+    for item in analysed_jobs:
         job = item["job"]
         result = item["result"]
 
         if job["stop_type"] == "Job":
+            stop_label = "SERVICE JOB"
             name = job["address"]
 
+        elif job["stop_type"] == "Agency Pickup":
+            stop_label = (
+                "AGENCY PICKUP — "
+                "NON-SERVICE STOP"
+            )
+
+            name = (
+                job["agency_name"]
+                or job["address"]
+            )
+
         else:
+            stop_label = (
+                "AGENCY DROP-OFF — "
+                "NON-SERVICE STOP"
+            )
+
             name = (
                 job["agency_name"]
                 or job["address"]
@@ -1778,38 +1929,56 @@ def generate_predictive_pdf(
 
         story.append(
             Paragraph(
-                (
-                    f"<b>Stop {job['position']} — "
-                    f"{format_time(job['planned_time'])}"
-                    f"</b>"
-                ),
+                f"<b>Stop {job['position']} — "
+                f"{format_time(job['planned_time'])}</b>",
                 styles["Heading3"]
             )
         )
 
         story.append(
             Paragraph(
-                (
-                    f"{job['stop_type']}<br/>"
-                    f"{name}<br/>"
-                    f"{job['suburb']} "
-                    f"{job['postcode']}"
-                ),
+                f"<b>{stop_label}</b><br/>"
+                f"{name}<br/>"
+                f"{job['suburb']} "
+                f"{job['postcode']}",
                 body_style
             )
         )
+
+        if (
+            job["stop_type"]
+            != "Job"
+        ):
+            story.append(
+                Paragraph(
+                    "This stop contributes to "
+                    "operational workload but not "
+                    "to service completion count.",
+                    small_style
+                )
+            )
+
+        if result["predicted_delay"] > 0:
+            story.append(
+                Paragraph(
+                    "<b>Predicted additional time: "
+                    f"+{round(result['predicted_delay'])} "
+                    "minutes</b>",
+                    body_style
+                )
+            )
 
         story.append(
             Paragraph(
-                (
-                    "<b>Predicted additional time: "
-                    f"+{round(result['predicted_delay'])} "
-                    "minutes</b>"
-                ),
+                "Cumulative predicted delay "
+                f"at this point: "
+                f"<b>+{round(result['cumulative_delay'])} "
+                "minutes</b>",
                 body_style
             )
         )
 
+        # PROPERTY REASONS
         if job["stop_type"] == "Job":
             for pattern in result[
                 "patterns"
@@ -1821,7 +1990,9 @@ def generate_predictive_pdf(
                     f"{pattern['confidence']} confidence"
                 )
 
-                if pattern["median_delay"]:
+                if pattern[
+                    "median_delay"
+                ]:
                     text += (
                         ", historical median "
                         f"+{round(pattern['median_delay'])} "
@@ -1840,10 +2011,8 @@ def generate_predictive_pdf(
                 ]:
                     story.append(
                         Paragraph(
-                            (
-                                "Recommended action: "
-                                + solution
-                            ),
+                            "Recommended action: "
+                            + solution,
                             body_style
                         )
                     )
@@ -1853,14 +2022,13 @@ def generate_predictive_pdf(
                 ]:
                     story.append(
                         Paragraph(
-                            (
-                                "Field note: "
-                                + note
-                            ),
+                            "Field note: "
+                            + note,
                             body_style
                         )
                     )
 
+        # AGENCY REASONS
         else:
             intelligence = result[
                 "intelligence"
@@ -1884,31 +2052,24 @@ def generate_predictive_pdf(
                 if profile["notes"]:
                     story.append(
                         Paragraph(
-                            (
-                                "Field note: "
-                                + profile["notes"]
-                            ),
+                            "Field note: "
+                            + profile["notes"],
                             body_style
                         )
                     )
 
                 if (
-                    profile[
-                        "recommended_action"
-                    ]
+                    profile["recommended_action"]
                     and
-                    profile[
-                        "recommended_action"
-                    ] != "None"
+                    profile["recommended_action"]
+                    != "None"
                 ):
                     story.append(
                         Paragraph(
-                            (
-                                "Recommended action: "
-                                + profile[
-                                    "recommended_action"
-                                ]
-                            ),
+                            "Recommended action: "
+                            + profile[
+                                "recommended_action"
+                            ],
                             body_style
                         )
                     )
@@ -1920,30 +2081,50 @@ def generate_predictive_pdf(
             )
         )
 
+    # --------------------------------------------------------
+    # EVIDENCE STATEMENT
+    # --------------------------------------------------------
+
     story.append(
         Spacer(
             1,
-            20
+            12
         )
     )
 
     story.append(
         Paragraph(
-            "Evidence statement",
+            "Evidence Statement",
             heading_style
         )
     )
 
     story.append(
         Paragraph(
-            (
-                "This report records recognised "
-                "operational difficulty patterns "
-                "identified before the scheduled day's "
-                "progression. Later cancellations, "
-                "schedule changes or actual outcomes do "
-                "not alter the original prediction."
-            ),
+            "This report records the scheduled "
+            "operational workload and recognised "
+            "difficulty patterns identified before "
+            "the day's progression. Service jobs "
+            "and agency movements are counted "
+            "separately so that required non-service "
+            "stops remain visible in the operational "
+            "record.",
+            body_style
+        )
+    )
+
+    story.append(
+        Spacer(
+            1,
+            8
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "Later cancellations, schedule changes "
+            "or actual outcomes do not alter this "
+            "original prediction snapshot.",
             body_style
         )
     )
@@ -1957,10 +2138,8 @@ def generate_predictive_pdf(
 
     story.append(
         Paragraph(
-            (
-                "Building Difficulty Intelligence — "
-                "prototype operational evidence report."
-            ),
+            "Building Difficulty Intelligence — "
+            "V3.4 Field Validation Build",
             small_style
         )
     )
@@ -1978,10 +2157,6 @@ def generate_predictive_pdf(
 
 # ============================================================
 # SAVE PREDICTION SNAPSHOT
-#
-# IMPORTANT:
-# This is stored as historical prediction evidence.
-# It is NOT used by build_patterns().
 # ============================================================
 
 def save_prediction_snapshot(
@@ -2006,7 +2181,7 @@ def save_prediction_snapshot(
         datetime.now().isoformat(),
         schedule_date.isoformat(),
         summary["total_stops"],
-        summary["total_jobs"],
+        summary["service_jobs"],
         summary["agency_pickups"],
         summary["agency_dropoffs"],
         summary["agency_stops"],
@@ -2021,6 +2196,8 @@ def save_prediction_snapshot(
     for item in analysed_jobs:
         job = item["job"]
         result = item["result"]
+
+        reasons = []
 
         if job["stop_type"] == "Job":
             reasons = [
@@ -2048,9 +2225,10 @@ def save_prediction_snapshot(
                 planned_time,
                 risk,
                 predicted_delay,
+                cumulative_delay,
                 reasons
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             report_id,
             job["position"],
@@ -2063,9 +2241,10 @@ def save_prediction_snapshot(
             job["planned_time"],
             result["risk"],
             round(
-                result[
-                    "predicted_delay"
-                ]
+                result["predicted_delay"]
+            ),
+            round(
+                result["cumulative_delay"]
             ),
             " | ".join(
                 reasons
@@ -2076,116 +2255,58 @@ def save_prediction_snapshot(
 
 
 # ============================================================
-# DASHBOARD — V3.5
-#
-# ONLY ACTUAL FIELD EVIDENCE IS COUNTED HERE.
+# DASHBOARD
 # ============================================================
 
 def show_dashboard():
     st.header(
-        "📊 Delay Intelligence"
+        "📊 Operational Intelligence"
     )
 
-    visits = get_visits()
     patterns = build_patterns()
+    visits = get_visits()
 
-    property_delay_reports = [
-        visit
-        for visit in visits
-        if not visit[
-            "no_difficulty"
-        ]
-    ]
+    start = week_start().isoformat()
 
-    agency_delay_rows = execute("""
-        SELECT *
-        FROM agency_delays
-        ORDER BY delay_date DESC
-    """).fetchall()
-
-    total_delay_reports = (
-        len(property_delay_reports)
-        +
-        len(agency_delay_rows)
-    )
-
-    recognised_patterns = [
+    new_delays = [
         pattern
         for pattern in patterns
-        if pattern["status"] in [
-            "Recognised",
-            "Confirmed"
-        ]
+        if pattern["first_seen"] >= start
     ]
 
-    recognised_locations = set()
+    recurring = [
+        pattern
+        for pattern in patterns
+        if (
+            pattern["first_seen"] >= start
+            and pattern["status"]
+            in [
+                "Recognised",
+                "Confirmed"
+            ]
+        )
+    ]
 
-    for pattern in recognised_patterns:
-        if pattern["location"]:
-            recognised_locations.add(
-                (
-                    clean(
-                        pattern["location"]
-                    ),
-                    pattern["level"]
-                )
-            )
+    scheduling = [
+        pattern
+        for pattern in recurring
+        if pattern["category"]
+        == "Scheduling"
+    ]
 
-    agency_names = execute("""
-        SELECT DISTINCT agency_name
+    total_minutes = sum(
+        visit["total_delay"]
+        for visit in visits
+    )
+
+    agency_rows = execute("""
+        SELECT *
         FROM agency_delays
-        WHERE agency_name IS NOT NULL
-        AND trim(agency_name) != ''
     """).fetchall()
 
-    recognised_agencies = []
-
-    for row in agency_names:
-        intelligence = (
-            get_agency_intelligence(
-                row["agency_name"]
-            )
-        )
-
-        if intelligence["recognised"]:
-            recognised_agencies.append(
-                row["agency_name"]
-            )
-
-    recognised_delay_values = []
-
-    for pattern in recognised_patterns:
-        for row in pattern["rows"]:
-            if row[
-                "delay_minutes"
-            ] > 0:
-                recognised_delay_values.append(
-                    row["delay_minutes"]
-                )
-
-    for agency_name in recognised_agencies:
-        intelligence = (
-            get_agency_intelligence(
-                agency_name
-            )
-        )
-
-        for row in intelligence[
-            "delays"
-        ]:
-            if row[
-                "delay_minutes"
-            ] > 0:
-                recognised_delay_values.append(
-                    row["delay_minutes"]
-                )
-
-    typical_recognised_delay = (
-        median(
-            recognised_delay_values
-        )
-        if recognised_delay_values
-        else 0
+    agency_minutes = sum(
+        row["delay_minutes"]
+        for row in agency_rows
     )
 
     col1, col2, col3 = st.columns(
@@ -2193,348 +2314,120 @@ def show_dashboard():
     )
 
     col1.metric(
-        "📝 Delay Reports",
-        total_delay_reports
+        "🆕 New Delays",
+        len(new_delays)
     )
 
     col2.metric(
-        "🔁 Difficult Locations",
-        len(
-            recognised_locations
-        )
+        "🔁 New Patterns",
+        len(recurring)
     )
 
     col3.metric(
-        "⏱️ Typical Delay",
+        "🕐 Scheduling",
+        len(scheduling)
+    )
+
+    col1, col2, col3 = st.columns(
+        3
+    )
+
+    col1.metric(
+        "🏢 Property Delay",
+        f"{total_minutes / 60:.1f} hrs"
+    )
+
+    col2.metric(
+        "🔑 Agency Delay",
+        f"{agency_minutes / 60:.1f} hrs"
+    )
+
+    reports = execute("""
+        SELECT COUNT(*) AS count
+        FROM prediction_reports
+    """).fetchone()
+
+    col3.metric(
+        "📄 Predictions",
+        reports["count"]
+    )
+
+    # V3.4 OPERATIONAL WORKLOAD
+    st.subheader(
+        "🚗 Recorded Operational Workload"
+    )
+
+    workload = execute("""
+        SELECT
+            COALESCE(SUM(total_jobs), 0)
+                AS jobs,
+            COALESCE(SUM(agency_pickups), 0)
+                AS pickups,
+            COALESCE(SUM(agency_dropoffs), 0)
+                AS dropoffs,
+            COALESCE(SUM(agency_stops), 0)
+                AS agency_stops
+        FROM prediction_reports
+    """).fetchone()
+
+    col1, col2, col3 = st.columns(
+        3
+    )
+
+    col1.metric(
+        "Service Jobs",
+        workload["jobs"]
+    )
+
+    col2.metric(
+        "Agency Stops",
+        workload["agency_stops"]
+    )
+
+    col3.metric(
+        "Non-Service / 100 Jobs",
         (
-            "+"
-            + str(
-                round(
-                    typical_recognised_delay
-                )
-            )
-            + " min"
+            f"{(
+                workload['agency_stops']
+                / workload['jobs']
+                * 100
+            ):.1f}"
+            if workload["jobs"] > 0
+            else "0"
         )
-    )
-
-    st.caption(
-        "Based only on actual field observations."
     )
 
     st.subheader(
-        "🧠 Intelligence Coverage"
+        "🧠 Recent Intelligence"
     )
 
-    confirmed_count = len([
-        pattern
-        for pattern in recognised_patterns
-        if pattern["status"]
-        == "Confirmed"
-    ])
-
-    recognised_count = len([
-        pattern
-        for pattern in recognised_patterns
-        if pattern["status"]
-        == "Recognised"
-    ])
-
-    col1, col2, col3 = st.columns(
-        3
-    )
-
-    col1.metric(
-        "✅ Confirmed",
-        confirmed_count
-    )
-
-    col2.metric(
-        "🔁 Recognised",
-        recognised_count
-    )
-
-    col3.metric(
-        "🔑 Difficult Agencies",
-        len(
-            recognised_agencies
-        )
-    )
-
-    st.divider()
-
-    # --------------------------------------------------------
-    # HIGHEST IMPACT DIFFICULTIES
-    # --------------------------------------------------------
-
-    st.subheader(
-        "⚠️ Highest Impact Difficulties"
-    )
-
-    difficulty_groups = {}
-
-    for pattern in recognised_patterns:
-        condition = pattern[
-            "condition_type"
-        ]
-
-        if condition not in difficulty_groups:
-            difficulty_groups[
-                condition
-            ] = {
-                "reports": 0,
-                "delays": [],
-                "locations": set()
-            }
-
-        difficulty_groups[
-            condition
-        ]["reports"] += pattern[
-            "count"
-        ]
-
-        difficulty_groups[
-            condition
-        ]["locations"].add(
-            clean(
-                pattern["location"]
-            )
-        )
-
-        for row in pattern["rows"]:
-            if row[
-                "delay_minutes"
-            ] > 0:
-                difficulty_groups[
-                    condition
-                ]["delays"].append(
-                    row[
-                        "delay_minutes"
-                    ]
-                )
-
-    for agency_name in recognised_agencies:
-        intelligence = (
-            get_agency_intelligence(
-                agency_name
-            )
-        )
-
-        for row in intelligence[
-            "delays"
-        ]:
-            condition = (
-                "Agency — "
-                + row[
-                    "delay_reason"
-                ]
-            )
-
-            if (
-                condition
-                not in difficulty_groups
-            ):
-                difficulty_groups[
-                    condition
-                ] = {
-                    "reports": 0,
-                    "delays": [],
-                    "locations": set()
-                }
-
-            difficulty_groups[
-                condition
-            ]["reports"] += 1
-
-            difficulty_groups[
-                condition
-            ]["locations"].add(
-                clean(
-                    agency_name
-                )
-            )
-
-            if row[
-                "delay_minutes"
-            ] > 0:
-                difficulty_groups[
-                    condition
-                ]["delays"].append(
-                    row[
-                        "delay_minutes"
-                    ]
-                )
-
-    ranked = []
-
-    for condition, data in (
-        difficulty_groups.items()
-    ):
-        typical_delay = (
-            median(
-                data["delays"]
-            )
-            if data["delays"]
-            else 0
-        )
-
-        impact_score = (
-            data["reports"]
-            *
-            max(
-                typical_delay,
-                1
-            )
-        )
-
-        ranked.append({
-            "condition": condition,
-            "reports": data[
-                "reports"
-            ],
-            "locations": len(
-                data[
-                    "locations"
-                ]
-            ),
-            "typical_delay": (
-                typical_delay
-            ),
-            "impact_score": (
-                impact_score
-            )
-        })
-
-    ranked.sort(
-        key=lambda item: item[
-            "impact_score"
-        ],
-        reverse=True
-    )
-
-    if not ranked:
+    if not new_delays:
         st.info(
-            "Not enough recognised field "
-            "evidence yet."
+            "No new property difficulty "
+            "intelligence this week."
         )
 
-    else:
-        for item in ranked[:5]:
-            st.write(
-                f"**{item['condition']}**"
-            )
-
-            st.caption(
-                (
-                    f"{item['reports']} reports • "
-                    f"{item['locations']} locations • "
-                    f"typical +"
-                    f"{round(item['typical_delay'])} min"
-                )
-            )
-
-            st.divider()
-
-    # --------------------------------------------------------
-    # RECENT OBSERVED INTELLIGENCE
-    # --------------------------------------------------------
-
-    st.subheader(
-        "🆕 Recent Field Intelligence"
-    )
-
-    recent_conditions = (
-        get_conditions()
-    )
-
-    recent_items = []
-
-    for row in recent_conditions:
-        recent_items.append({
-            "date": row[
-                "visit_date"
-            ],
-            "type": "Property",
-            "location": row[
-                "address"
-            ],
-            "condition": row[
-                "condition_type"
-            ],
-            "delay": row[
-                "delay_minutes"
-            ]
-        })
-
-    for row in agency_delay_rows:
-        recent_items.append({
-            "date": row[
-                "delay_date"
-            ],
-            "type": "Agency",
-            "location": row[
-                "agency_name"
-            ],
-            "condition": row[
-                "delay_reason"
-            ],
-            "delay": row[
-                "delay_minutes"
-            ]
-        })
-
-    recent_items.sort(
-        key=lambda item: item[
-            "date"
-        ],
-        reverse=True
-    )
-
-    if not recent_items:
-        st.info(
-            "No field delay intelligence "
-            "recorded yet."
-        )
-
-    for item in recent_items[:8]:
-        icon = (
-            "🏢"
-            if item["type"]
-            == "Property"
-            else "🔑"
+    for pattern in new_delays[:8]:
+        st.write(
+            f"**{pattern['location']}**"
         )
 
         st.write(
-            f"**{icon} "
-            f"{item['location']}**"
+            f"{pattern['condition_type']} — "
+            f"{pattern['status']}"
         )
 
-        if item["delay"] > 0:
-            st.write(
-                f"{item['condition']} — "
-                f"**+{item['delay']} min**"
+        if pattern["median_delay"]:
+            st.caption(
+                "Typical delay "
+                f"+{round(pattern['median_delay'])} min"
             )
-
-        else:
-            st.write(
-                item["condition"]
-            )
-
-        st.caption(
-            f"Observed {item['date']}"
-        )
 
         st.divider()
 
-    st.caption(
-        "Predictive schedule uploads are "
-        "stored separately as pre-day evidence. "
-        "They do not teach or inflate the "
-        "difficulty intelligence engine."
-    )
-
 
 # ============================================================
-# REPORT DELAY PAGE
+# REPORT PAGE
 # ============================================================
 
 def show_report_page():
@@ -2553,9 +2446,8 @@ def show_report_page():
 
     st.divider()
 
-    if (
-        report_type
-        == "🏢 Property / Building"
+    if report_type == (
+        "🏢 Property / Building"
     ):
         visit_date = st.date_input(
             "Visit date",
@@ -2604,21 +2496,17 @@ def show_report_page():
             ):
                 category = "Scheduling"
 
-                condition_type = (
-                    st.selectbox(
-                        "Condition",
-                        SCHEDULING_CONDITIONS
-                    )
+                condition_type = st.selectbox(
+                    "Condition",
+                    SCHEDULING_CONDITIONS
                 )
 
             else:
                 category = "Site"
 
-                condition_type = (
-                    st.selectbox(
-                        "Condition",
-                        SITE_CONDITIONS
-                    )
+                condition_type = st.selectbox(
+                    "Condition",
+                    SITE_CONDITIONS
                 )
 
             delay = st.number_input(
@@ -2628,15 +2516,13 @@ def show_report_page():
                 value=0
             )
 
-            applicability = (
-                st.selectbox(
-                    "When does it apply?",
-                    [
-                        "Always",
-                        "Certain times",
-                        "Certain days and times"
-                    ]
-                )
+            applicability = st.selectbox(
+                "When does it apply?",
+                [
+                    "Always",
+                    "Certain times",
+                    "Certain days and times"
+                ]
             )
 
             selected_days = []
@@ -2647,17 +2533,15 @@ def show_report_page():
                 applicability
                 == "Certain days and times"
             ):
-                selected_days = (
-                    st.multiselect(
-                        "Days",
-                        DAYS,
-                        default=DAYS[:5]
-                    )
+                selected_days = st.multiselect(
+                    "Days",
+                    DAYS,
+                    default=DAYS[:5]
                 )
 
             if applicability != "Always":
-                col1, col2 = (
-                    st.columns(2)
+                col1, col2 = st.columns(
+                    2
                 )
 
                 with col1:
@@ -2706,13 +2590,10 @@ def show_report_page():
                     )
                 )
 
-            concierge = (
-                solution
-                in [
-                    "Concierge parking booking",
-                    "Contact concierge before arrival"
-                ]
-            )
+            concierge = solution in [
+                "Concierge parking booking",
+                "Contact concierge before arrival"
+            ]
 
             if st.button(
                 "➕ Add Delay",
@@ -2720,20 +2601,12 @@ def show_report_page():
             ):
                 st.session_state.conditions.append({
                     "category": category,
-                    "condition_type": (
-                        condition_type
-                    ),
+                    "condition_type": condition_type,
                     "delay_minutes": delay,
-                    "applicability": (
-                        applicability
-                    ),
+                    "applicability": applicability,
                     "days": selected_days,
-                    "start_time": (
-                        start_value
-                    ),
-                    "end_time": (
-                        end_value
-                    ),
+                    "start_time": start_value,
+                    "end_time": end_value,
                     "source_status": (
                         "Field observation"
                     ),
@@ -2762,9 +2635,7 @@ def show_report_page():
 
                 if st.button(
                     "Remove",
-                    key=(
-                        f"remove_{index}"
-                    )
+                    key=f"remove_{index}"
                 ):
                     st.session_state.conditions.pop(
                         index
@@ -2788,8 +2659,7 @@ def show_report_page():
 
             elif (
                 not no_difficulty
-                and not
-                st.session_state.conditions
+                and not st.session_state.conditions
             ):
                 st.error(
                     "Add a delay first."
@@ -2853,22 +2723,17 @@ def show_report_page():
         general_note = st.text_area(
             "Field note",
             placeholder=(
-                "Example: This agency usually "
-                "takes a while."
+                "Example: This agency "
+                "usually takes a while."
             )
         )
 
-        recommended_action = (
-            st.selectbox(
-                "Recommended action",
-                AGENCY_ACTIONS
-            )
+        recommended_action = st.selectbox(
+            "Recommended action",
+            AGENCY_ACTIONS
         )
 
-        if (
-            recommended_action
-            == "Other"
-        ):
+        if recommended_action == "Other":
             recommended_action = (
                 st.text_input(
                     "Recommended action details"
@@ -2942,12 +2807,8 @@ def show_schedule_page():
         )
 
         uploader_key = (
-            "schedule_upload_"
-            + str(
-                st.session_state[
-                    "schedule_uploader_key"
-                ]
-            )
+            f"schedule_upload_"
+            f"{st.session_state.schedule_uploader_key}"
         )
 
         screenshots = st.file_uploader(
@@ -2982,10 +2843,8 @@ def show_schedule_page():
                     screenshots
                 ):
                     with st.spinner(
-                        (
-                            "Reading screenshot "
-                            f"{index + 1}..."
-                        )
+                        "Reading screenshot "
+                        f"{index + 1}..."
                     ):
                         text = extract_text(
                             screenshot
@@ -3010,7 +2869,6 @@ def show_schedule_page():
                                         "address"
                                     ]
                                 )
-
                                 for existing
                                 in combined_jobs
                             )
@@ -3021,21 +2879,15 @@ def show_schedule_page():
                                 )
 
                     progress.progress(
-                        (
-                            index + 1
-                        )
+                        (index + 1)
                         /
-                        len(
-                            screenshots
-                        )
+                        len(screenshots)
                     )
 
                 def job_sort(job):
                     try:
                         return datetime.strptime(
-                            job[
-                                "planned_time"
-                            ],
+                            job["planned_time"],
                             "%H:%M"
                         ).time()
 
@@ -3053,9 +2905,9 @@ def show_schedule_page():
                     combined_jobs,
                     start=1
                 ):
-                    job[
-                        "position"
-                    ] = position
+                    job["position"] = (
+                        position
+                    )
 
                 st.session_state.extracted_jobs = (
                     combined_jobs
@@ -3088,7 +2940,8 @@ def show_schedule_page():
         )
 
         st.caption(
-            "Only correct anything the reader got wrong."
+            "Only correct anything "
+            "the reader got wrong."
         )
 
         if not jobs:
@@ -3116,31 +2969,24 @@ def show_schedule_page():
         ):
             icon = (
                 "🔑"
-                if job["stop_type"]
-                != "Job"
+                if job["stop_type"] != "Job"
                 else "🏠"
             )
 
             title_name = (
                 job["agency_name"]
-
                 if (
                     job["stop_type"]
                     != "Job"
-                    and job[
-                        "agency_name"
-                    ]
+                    and job["agency_name"]
                 )
-
                 else job["address"]
             )
 
             with st.expander(
-                (
-                    f"{icon} {index + 1}. "
-                    f"{format_time(job['planned_time'])} "
-                    f"— {title_name}"
-                )
+                f"{icon} {index + 1}. "
+                f"{format_time(job['planned_time'])} — "
+                f"{title_name}"
             ):
                 stop_options = [
                     "Job",
@@ -3153,59 +2999,46 @@ def show_schedule_page():
                     stop_options,
                     index=(
                         stop_options.index(
-                            job[
-                                "stop_type"
-                            ]
+                            job["stop_type"]
                         )
-                        if job[
-                            "stop_type"
-                        ] in stop_options
+                        if job["stop_type"]
+                        in stop_options
                         else 0
                     ),
                     key=f"type_{index}"
                 )
 
-                planned_time = (
-                    st.text_input(
-                        "Anticipated time",
-                        value=job[
-                            "planned_time"
-                        ],
-                        key=f"time_{index}"
-                    )
+                planned_time = st.text_input(
+                    "Anticipated time",
+                    value=job[
+                        "planned_time"
+                    ],
+                    key=f"time_{index}"
                 )
 
                 address = st.text_input(
                     "Address",
-                    value=job[
-                        "address"
-                    ],
+                    value=job["address"],
                     key=f"address_{index}"
                 )
 
                 suburb = st.text_input(
                     "Suburb",
-                    value=job[
-                        "suburb"
-                    ],
+                    value=job["suburb"],
                     key=f"suburb_{index}"
                 )
 
                 postcode = st.text_input(
                     "Postcode",
-                    value=job[
-                        "postcode"
-                    ],
+                    value=job["postcode"],
                     key=f"postcode_{index}"
                 )
 
-                agency_name = job[
-                    "agency_name"
-                ]
+                agency_name = (
+                    job["agency_name"]
+                )
 
-                job_id = job[
-                    "job_id"
-                ]
+                job_id = job["job_id"]
 
                 if stop_type == "Job":
                     job_id = st.text_input(
@@ -3220,12 +3053,8 @@ def show_schedule_page():
                     agency_name = (
                         st.text_input(
                             "Agency",
-                            value=(
-                                agency_name
-                            ),
-                            key=(
-                                f"agency_{index}"
-                            )
+                            value=agency_name,
+                            key=f"agency_{index}"
                         )
                     )
 
@@ -3240,12 +3069,9 @@ def show_schedule_page():
                 if include:
                     reviewed.append({
                         "position": (
-                            len(reviewed)
-                            + 1
+                            len(reviewed) + 1
                         ),
-                        "stop_type": (
-                            stop_type
-                        ),
+                        "stop_type": stop_type,
                         "job_id": job_id,
                         "agency_name": (
                             agency_name
@@ -3256,9 +3082,7 @@ def show_schedule_page():
                             )
                         ),
                         "suburb": suburb,
-                        "postcode": (
-                            postcode
-                        ),
+                        "postcode": postcode,
                         "planned_time": (
                             normalise_time(
                                 planned_time
@@ -3266,6 +3090,65 @@ def show_schedule_page():
                             or planned_time
                         )
                     })
+
+        # LIVE WORKLOAD PREVIEW
+        service_preview = sum(
+            1
+            for job in reviewed
+            if job["stop_type"] == "Job"
+        )
+
+        pickup_preview = sum(
+            1
+            for job in reviewed
+            if job["stop_type"]
+            == "Agency Pickup"
+        )
+
+        dropoff_preview = sum(
+            1
+            for job in reviewed
+            if job["stop_type"]
+            == "Agency Drop-off"
+        )
+
+        agency_preview = (
+            pickup_preview
+            + dropoff_preview
+        )
+
+        st.subheader(
+            "🚗 Schedule Workload"
+        )
+
+        col1, col2, col3 = st.columns(
+            3
+        )
+
+        col1.metric(
+            "Service Jobs",
+            service_preview
+        )
+
+        col2.metric(
+            "Agency Stops",
+            agency_preview
+        )
+
+        col3.metric(
+            "Operational Stops",
+            len(reviewed)
+        )
+
+        if agency_preview > 0:
+            st.info(
+                f"This schedule contains "
+                f"{service_preview} service jobs "
+                f"+ {agency_preview} necessary "
+                "agency stop(s) = "
+                f"{len(reviewed)} total "
+                "operational stops."
+            )
 
         col1, col2 = st.columns(
             2
@@ -3287,119 +3170,50 @@ def show_schedule_page():
             ):
                 analysed = []
 
-                total_delay = 0
-                flagged = 0
-                total_jobs = 0
-                agency_pickups = 0
-                agency_dropoffs = 0
-
                 for job in reviewed:
                     if (
                         job["stop_type"]
                         == "Job"
                     ):
-                        total_jobs += 1
-
                         result = (
                             analyse_property_job(
-                                job[
-                                    "address"
-                                ],
-                                job[
-                                    "suburb"
-                                ],
+                                job["address"],
+                                job["suburb"],
                                 job[
                                     "planned_time"
                                 ],
-                                st.session_state[
-                                    "analysis_date"
-                                ]
+                                st.session_state.analysis_date
                             )
                         )
 
                     else:
-                        if (
-                            job["stop_type"]
-                            == "Agency Pickup"
-                        ):
-                            agency_pickups += 1
-
-                        elif (
-                            job["stop_type"]
-                            == "Agency Drop-off"
-                        ):
-                            agency_dropoffs += 1
-
                         result = (
                             analyse_agency_stop(
                                 job
                             )
                         )
 
-                    if (
-                        result[
-                            "predicted_delay"
-                        ] > 0
-                    ):
-                        flagged += 1
-
-                    total_delay += (
-                        result[
-                            "predicted_delay"
-                        ]
-                    )
-
                     analysed.append({
                         "job": job,
                         "result": result
                     })
 
-                agency_stops = (
-                    agency_pickups
-                    +
-                    agency_dropoffs
+                summary = (
+                    calculate_workload_summary(
+                        analysed
+                    )
                 )
 
-                summary = {
-                    "total_stops": (
-                        len(reviewed)
-                    ),
-                    "total_jobs": (
-                        total_jobs
-                    ),
-                    "agency_pickups": (
-                        agency_pickups
-                    ),
-                    "agency_dropoffs": (
-                        agency_dropoffs
-                    ),
-                    "agency_stops": (
-                        agency_stops
-                    ),
-                    "flagged_stops": (
-                        flagged
-                    ),
-                    "predicted_delay": (
-                        total_delay
-                    )
-                }
-
                 save_prediction_snapshot(
-                    st.session_state[
-                        "analysis_date"
-                    ],
+                    st.session_state.analysis_date,
                     analysed,
                     summary
                 )
 
-                pdf = (
-                    generate_predictive_pdf(
-                        st.session_state[
-                            "analysis_date"
-                        ],
-                        analysed,
-                        summary
-                    )
+                pdf = generate_predictive_pdf(
+                    st.session_state.analysis_date,
+                    analysed,
+                    summary
                 )
 
                 st.session_state.analysed_jobs = (
@@ -3429,15 +3243,11 @@ def show_schedule_page():
         == "analysis"
     ):
         summary = (
-            st.session_state[
-                "analysis_summary"
-            ]
+            st.session_state.analysis_summary
         )
 
         analysed = (
-            st.session_state[
-                "analysed_jobs"
-            ]
+            st.session_state.analysed_jobs
         )
 
         st.subheader(
@@ -3445,60 +3255,67 @@ def show_schedule_page():
         )
 
         st.caption(
-            st.session_state[
-                "analysis_date"
-            ].strftime(
+            st.session_state.analysis_date.strftime(
                 "%A %d %B %Y"
             )
         )
 
-        col1, col2, col3 = (
-            st.columns(3)
+        # V3.4 PRIMARY WORKLOAD
+        col1, col2, col3 = st.columns(
+            3
         )
 
         col1.metric(
-            "Service Jobs",
-            summary[
-                "total_jobs"
-            ]
+            "🏠 Service Jobs",
+            summary["service_jobs"]
         )
 
         col2.metric(
-            "Agency Stops",
-            summary[
-                "agency_stops"
-            ]
+            "🔑 Agency Stops",
+            summary["agency_stops"]
         )
 
         col3.metric(
-            "Predicted Delay",
-            (
-                "+"
-                + str(
-                    round(
-                        summary[
-                            "predicted_delay"
-                        ]
-                    )
-                )
-                + " min"
-            )
+            "🚗 Operational Stops",
+            summary["total_stops"]
         )
 
-        st.caption(
-            (
-                f"🔑 Pickups: "
-                f"{summary['agency_pickups']} • "
-                f"Drop-offs: "
-                f"{summary['agency_dropoffs']} • "
-                f"Flagged stops: "
-                f"{summary['flagged_stops']}"
-            )
+        col1, col2, col3 = st.columns(
+            3
         )
 
-        if summary[
-            "flagged_stops"
-        ]:
+        col1.metric(
+            "Agency Pickups",
+            summary["agency_pickups"]
+        )
+
+        col2.metric(
+            "Agency Drop-offs",
+            summary["agency_dropoffs"]
+        )
+
+        col3.metric(
+            "⚠️ Flagged",
+            summary["flagged_stops"]
+        )
+
+        st.metric(
+            "⏱ Predicted Operational Delay",
+            f"+{round(summary['predicted_delay'])} min"
+        )
+
+        if summary["agency_stops"] > 0:
+            st.info(
+                f"Today's schedule contains "
+                f"{summary['service_jobs']} "
+                "service jobs plus "
+                f"{summary['agency_stops']} "
+                "necessary agency stops. "
+                f"Actual operational workload: "
+                f"{summary['total_stops']} stops."
+            )
+
+        if summary["flagged_stops"]:
             st.warning(
                 "Recognised operational "
                 "difficulties exist in "
@@ -3516,65 +3333,63 @@ def show_schedule_page():
         )
 
         for item in analysed:
-            job = item[
-                "job"
-            ]
+            job = item["job"]
+            result = item["result"]
 
-            result = item[
-                "result"
-            ]
-
-            if (
-                job["stop_type"]
-                == "Job"
-            ):
-                name = job[
-                    "address"
-                ]
+            if job["stop_type"] == "Job":
+                name = job["address"]
 
             else:
                 name = (
-                    job[
-                        "agency_name"
-                    ]
-                    or job[
-                        "address"
-                    ]
+                    job["agency_name"]
+                    or job["address"]
                 )
 
             st.markdown(
-                (
-                    f"### {result['icon']} "
-                    f"{format_time(job['planned_time'])} "
-                    f"— {name}"
-                )
+                f"### {result['icon']} "
+                f"{format_time(job['planned_time'])} — "
+                f"{name}"
             )
 
-            st.caption(
-                job[
-                    "stop_type"
-                ]
-            )
+            if job["stop_type"] == "Job":
+                st.caption(
+                    "🏠 Service job"
+                )
+
+            elif (
+                job["stop_type"]
+                == "Agency Pickup"
+            ):
+                st.caption(
+                    "🔑 Agency pickup — "
+                    "non-service operational stop"
+                )
+
+            else:
+                st.caption(
+                    "🔑 Agency drop-off — "
+                    "non-service operational stop"
+                )
 
             if job["suburb"]:
                 st.caption(
-                    (
-                        f"{job['suburb']} "
-                        f"{job['postcode']}"
-                    )
+                    f"{job['suburb']} "
+                    f"{job['postcode']}"
                 )
 
             if result[
                 "predicted_delay"
             ]:
                 st.write(
-                    (
-                        "Predicted additional "
-                        "time: "
-                        f"**+{round(result['predicted_delay'])} "
-                        "min**"
-                    )
+                    "Predicted additional time: "
+                    f"**+{round(result['predicted_delay'])} "
+                    "min**"
                 )
+
+            st.caption(
+                "Cumulative predicted delay: "
+                f"+{round(result['cumulative_delay'])} min"
+            )
 
             if (
                 job["stop_type"]
@@ -3584,11 +3399,8 @@ def show_schedule_page():
                     "patterns"
                 ]:
                     st.write(
-                        (
-                            f"• "
-                            f"{pattern['condition_type']} "
-                            f"— {pattern['status']}"
-                        )
+                        f"• {pattern['condition_type']} "
+                        f"— {pattern['status']}"
                     )
 
                     for solution in pattern[
@@ -3624,16 +3436,10 @@ def show_schedule_page():
                 ]
 
                 if profile:
-                    if profile[
-                        "notes"
-                    ]:
+                    if profile["notes"]:
                         st.info(
-                            (
-                                "📝 "
-                                + profile[
-                                    "notes"
-                                ]
-                            )
+                            f"📝 "
+                            f"{profile['notes']}"
                         )
 
                     if (
@@ -3647,15 +3453,15 @@ def show_schedule_page():
                         != "None"
                     ):
                         st.success(
-                            (
-                                "💡 "
-                                + profile[
-                                    "recommended_action"
-                                ]
-                            )
+                            "💡 "
+                            f"{profile['recommended_action']}"
                         )
 
             st.divider()
+
+        # ----------------------------------------------------
+        # PDF
+        # ----------------------------------------------------
 
         st.subheader(
             "📄 Evidence Report"
@@ -3663,25 +3469,22 @@ def show_schedule_page():
 
         filename = (
             "predictive_report_"
-            + st.session_state[
-                "analysis_date"
-            ].isoformat()
+            + st.session_state.analysis_date.isoformat()
             + ".pdf"
         )
 
         st.download_button(
             "📄 Open / Save Predictive PDF",
-            data=st.session_state[
-                "generated_pdf"
-            ],
+            data=st.session_state.generated_pdf,
             file_name=filename,
             mime="application/pdf",
             use_container_width=True
         )
 
         st.caption(
-            "On iPhone, open the PDF and use "
-            "Share to Mail it or Save to Files."
+            "On iPhone, open the PDF "
+            "and use Share to Mail it "
+            "or Save to Files."
         )
 
         default_email = get_setting(
@@ -3690,16 +3493,15 @@ def show_schedule_page():
 
         if default_email:
             st.info(
-                (
-                    "📧 Intended recipient: "
-                    + default_email
-                )
+                "📧 Intended recipient: "
+                f"{default_email}"
             )
 
         st.caption(
-            "This prediction is historical "
-            "pre-day evidence only. It does not "
-            "teach the difficulty engine."
+            "The prediction was recorded "
+            "before the day's progression. "
+            "Later cancellations do not "
+            "alter the evidence snapshot."
         )
 
         if st.button(
@@ -3741,13 +3543,9 @@ def show_profiles():
 
         locations = sorted(
             set(
-                pattern[
-                    "location"
-                ]
+                pattern["location"]
                 for pattern in patterns
-                if pattern[
-                    "location"
-                ]
+                if pattern["location"]
             )
         )
 
@@ -3759,15 +3557,12 @@ def show_profiles():
         location_patterns = [
             pattern
             for pattern in patterns
-            if pattern[
-                "location"
-            ] == selected
+            if pattern["location"]
+            == selected
         ]
 
         concierge = any(
-            pattern[
-                "concierge"
-            ]
+            pattern["concierge"]
             for pattern
             in location_patterns
         )
@@ -3783,21 +3578,16 @@ def show_profiles():
 
         for pattern in location_patterns:
             st.write(
-                (
-                    f"**"
-                    f"{pattern['condition_type']}"
-                    f"**"
-                )
+                f"**{pattern['condition_type']}**"
             )
 
             st.caption(
-                (
-                    f"{pattern['count']} reports • "
-                    f"{pattern['status']} • "
-                    f"{pattern['confidence']} confidence • "
-                    f"+{round(pattern['median_delay'])} "
-                    "min typical"
-                )
+                f"{pattern['count']} reports • "
+                f"{pattern['status']} • "
+                f"{pattern['confidence']} "
+                "confidence • "
+                f"+{round(pattern['median_delay'])} "
+                "min typical"
             )
 
             for solution in pattern[
@@ -3833,16 +3623,12 @@ def show_profiles():
 
         for agency in agencies:
             names.add(
-                agency[
-                    "agency_name"
-                ]
+                agency["agency_name"]
             )
 
         for row in delay_names:
             names.add(
-                row[
-                    "agency_name"
-                ]
+                row["agency_name"]
             )
 
         if not names:
@@ -3873,24 +3659,13 @@ def show_profiles():
 
         col1.metric(
             "Delay Reports",
-            intelligence[
-                "count"
-            ]
+            intelligence["count"]
         )
 
         col2.metric(
             "Typical Delay",
-            (
-                "+"
-                + str(
-                    round(
-                        intelligence[
-                            "typical_delay"
-                        ]
-                    )
-                )
-                + " min"
-            )
+            f"+{round(intelligence['typical_delay'])} "
+            "min"
         )
 
         profile = intelligence[
@@ -3898,16 +3673,9 @@ def show_profiles():
         ]
 
         if profile:
-            if profile[
-                "notes"
-            ]:
+            if profile["notes"]:
                 st.info(
-                    (
-                        "📝 "
-                        + profile[
-                            "notes"
-                        ]
-                    )
+                    f"📝 {profile['notes']}"
                 )
 
             if (
@@ -3921,12 +3689,8 @@ def show_profiles():
                 != "None"
             ):
                 st.success(
-                    (
-                        "💡 "
-                        + profile[
-                            "recommended_action"
-                        ]
-                    )
+                    "💡 "
+                    f"{profile['recommended_action']}"
                 )
 
         if intelligence[
@@ -3972,11 +3736,9 @@ def show_history():
 
         for visit in visits:
             with st.expander(
-                (
-                    f"{visit['visit_date']} — "
-                    f"{visit['address']} — "
-                    f"{visit['total_delay']} min"
-                )
+                f"{visit['visit_date']} — "
+                f"{visit['address']} — "
+                f"{visit['total_delay']} min"
             ):
                 rows = execute("""
                     SELECT *
@@ -3989,20 +3751,13 @@ def show_history():
 
                 for row in rows:
                     st.write(
-                        (
-                            f"**"
-                            f"{row['condition_type']}"
-                            f"** — "
-                            f"{row['delay_minutes']} "
-                            "min"
-                        )
+                        f"**{row['condition_type']}** "
+                        f"— {row['delay_minutes']} min"
                     )
 
                 if visit["notes"]:
                     st.write(
-                        visit[
-                            "notes"
-                        ]
+                        visit["notes"]
                     )
 
     elif (
@@ -4012,8 +3767,9 @@ def show_history():
         rows = execute("""
             SELECT *
             FROM agency_delays
-            ORDER BY delay_date DESC,
-            created_at DESC
+            ORDER BY
+                delay_date DESC,
+                created_at DESC
         """).fetchall()
 
         if not rows:
@@ -4025,26 +3781,18 @@ def show_history():
 
         for row in rows:
             with st.expander(
-                (
-                    f"{row['delay_date']} — "
-                    f"{row['agency_name']} — "
-                    f"{row['delay_minutes']} min"
-                )
+                f"{row['delay_date']} — "
+                f"{row['agency_name']} — "
+                f"{row['delay_minutes']} min"
             ):
                 st.write(
-                    (
-                        "**Reason:** "
-                        + row[
-                            "delay_reason"
-                        ]
-                    )
+                    f"**Reason:** "
+                    f"{row['delay_reason']}"
                 )
 
                 if row["notes"]:
                     st.write(
-                        row[
-                            "notes"
-                        ]
+                        row["notes"]
                     )
 
     else:
@@ -4064,61 +3812,49 @@ def show_history():
         for report in reports:
             generated = (
                 datetime.fromisoformat(
-                    report[
-                        "created_at"
-                    ]
+                    report["created_at"]
                 )
             )
 
             with st.expander(
-                (
-                    f"{report['schedule_date']} — "
-                    f"{report['flagged_stops']} "
-                    "flagged — "
-                    f"+{report['predicted_delay']} min"
-                )
+                f"{report['schedule_date']} — "
+                f"{report['total_jobs']} jobs + "
+                f"{report['agency_stops']} agency — "
+                f"+{report['predicted_delay']} min"
             ):
                 st.write(
-                    (
-                        "Generated "
-                        + generated.strftime(
-                            "%d %b %Y %I:%M %p"
-                        )
-                    )
+                    "Generated "
+                    f"{generated.strftime('%d %b %Y %I:%M %p')}"
                 )
 
                 st.write(
-                    (
-                        "**Service jobs:** "
-                        f"{report['total_jobs']}"
-                    )
+                    "**Service jobs:** "
+                    f"{report['total_jobs']}"
                 )
 
                 st.write(
-                    (
-                        "**Agency pickups:** "
-                        f"{report['agency_pickups']}"
-                    )
+                    "**Agency pickups:** "
+                    f"{report['agency_pickups']}"
                 )
 
                 st.write(
-                    (
-                        "**Agency drop-offs:** "
-                        f"{report['agency_dropoffs']}"
-                    )
+                    "**Agency drop-offs:** "
+                    f"{report['agency_dropoffs']}"
                 )
 
                 st.write(
-                    (
-                        "**Predicted delay:** "
-                        f"+{report['predicted_delay']} "
-                        "min"
-                    )
+                    "**Total agency stops:** "
+                    f"{report['agency_stops']}"
                 )
 
-                st.caption(
-                    "Prediction evidence only — "
-                    "not counted as completed work."
+                st.write(
+                    "**Total operational stops:** "
+                    f"{report['total_stops']}"
+                )
+
+                st.write(
+                    "**Predicted delay:** "
+                    f"+{report['predicted_delay']} min"
                 )
 
 
@@ -4132,8 +3868,8 @@ def show_settings():
     )
 
     st.write(
-        "Set the email address you normally "
-        "send predictive reports to."
+        "Set the email address you "
+        "normally send predictive reports to."
     )
 
     current_email = get_setting(
@@ -4171,20 +3907,12 @@ def show_settings():
 
     st.divider()
 
-    st.subheader(
-        "📸 Schedule Import"
-    )
-
-    st.write(
-        "Current prototype method: "
-        "upload Field screenshots."
-    )
-
     st.caption(
-        "A future production version could "
-        "connect to an authorised schedule "
-        "source or API so the day's schedule "
-        "is imported automatically."
+        "For the Streamlit proof-of-concept, "
+        "the PDF is downloaded/opened and "
+        "shared using the iPhone Share sheet. "
+        "Direct email attachment delivery can "
+        "be added to the production version."
     )
 
 
